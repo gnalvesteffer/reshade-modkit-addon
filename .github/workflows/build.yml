@@ -16,15 +16,21 @@ jobs:
         with:
           persist-credentials: false
       - uses: microsoft/setup-msbuild@v3
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
       - name: Build x64 add-on
         run: |
           cmake -S . -B build -A x64
           cmake --build build --config Release --parallel
+      - name: Package DXIL disassembler
+        run: python scripts/fetch-dxc.py --destination build/Release
       - uses: actions/upload-artifact@v7
         with:
           name: ModKit-addon-x64
           path: |
             build/Release/ModKit.addon64
+            build/Release/ModKit-tools/
             README.md
             MODKIT.md
             LICENSE.md
@@ -33,3 +39,5 @@ jobs:
             vendor/imgui/LICENSE.txt
             vendor/stb/LICENSE
             vendor/minhook/LICENSE.txt
+            vendor/dxc/LICENSE-MS.txt
+            vendor/dxc/LICENSE-LLVM.txt

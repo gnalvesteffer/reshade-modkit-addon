@@ -6,13 +6,14 @@ This implementation uses ReShade's existing Direct3D 9/10/11/12, OpenGL and Vulk
 
 ## Build and install
 
-Install a compatible **full add-on support** ReShade build (SDK API 20 / ImGui 1.92.5), then copy `ModKit.addon64` beside its proxy DLL. This project builds only the add-on; it does not replace ReShade. Open **Home → Mod Kit**. Remove or disable any built-in fork version before loading this add-on, to avoid running two inspectors.
+Install a compatible **full add-on support** ReShade build (SDK API 20 / ImGui 1.92.5), then copy `ModKit.addon64` and `ModKit-tools/` beside its proxy DLL. This project builds only the add-on; it does not replace ReShade. Open **Home → Mod Kit**. Remove or disable any built-in fork version before loading this add-on, to avoid running two inspectors.
 
 Windows, from a Visual Studio developer shell:
 
 ```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
+python scripts/fetch-dxc.py --destination build/Release
 ```
 
 Linux with MinGW:
@@ -20,22 +21,33 @@ Linux with MinGW:
 ```sh
 cmake -S . -B build-mingw -DCMAKE_TOOLCHAIN_FILE=mingw64.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build build-mingw --parallel
+python3 scripts/fetch-dxc.py --destination build-mingw
 ```
 
-All build dependencies are vendored with their licenses and pinned revisions in `vendor/versions.json`. No injector build, fork-specific SDK events, or submodule downloads are needed.
+Build headers and sources are vendored with their licenses and pinned revisions in `vendor/versions.json`. The packaging script downloads a pinned Microsoft DXC release and checks its SHA256 before extracting the disassembler and its licenses. No injector build, fork-specific SDK events, or submodule downloads are needed.
 
 ## Inspector workflow
 
 1. Select **Capture next frame**, or enable **Live capture**. **Freeze** keeps the displayed frame while gameplay continues.
-2. Select an action in **Frame / pipeline**. The detail pane shows bound shader IDs, textures, buffers, render targets, viewports, scissors and dynamic state. Search by shader/resource ID, action or region label.
+2. Select an action in **Frame / pipeline**. The detail pane shows bound shader IDs, textures, buffers, render targets, viewports, scissors and dynamic state. Search by shader label, shader/resource ID or action.
 3. Export a shader, texture or buffer; or create a replacement from a captured resource. Each game's files live under `reshade-modkit/<executable-name>/` beside the ReShade configuration.
 4. Edit replacement files externally, or use **Edit source** and **Editor / rules**. GLSL source can be edited directly. DXBC Shader Model 4/5 HLSL replacements can be compiled in the panel. DXIL/Shader Model 6 requires an external compiler such as DXC; SPIR-V requires an external SPIR-V compiler. Keep the original stage, entry point and resource/input/output interface compatible.
 5. Leave **Watch replacement files** enabled to reload changes about every 500 ms, or select **Reload mods**. Compilation and GPU allocation happen when a replacement is first needed, and can briefly stall rendering.
 6. Toggle **Suppress draws using this shader** to identify the geometry or effect a shader draws. Toggle the resource's replacement checkbox, or **Enable mods**, to compare the original and modified graphics.
 
-The shader browser includes bytecode disassembly for formats accepted by Windows' D3D disassembler and GLSL source. The texture browser previews an owned snapshot or replacement. **Capture CPU uploads** in **Session** is off by default; enable it to collect bytes and content IDs from newly observed uploads. Existing GPU-only resources remain session IDs until their contents are captured. The buffer browser shows the first 4 KiB as hexadecimal. **Snapshot GPU contents** reads buffers and base texture mips on Direct3D 9/10/11 and OpenGL, where ReShade abstracts synchronization implicitly. This explicit readback waits for the GPU and can stall a frame.
+The shader browser includes DXBC disassembly, DXIL assembly using the bundled Microsoft DXC library, and GLSL source. Open **Shader disassembly/source** to read it; **Export disassembly** saves text in `captures/`. Original HLSL is not reconstructed from bytecode. SPIR-V still requires an external disassembler. Disassembly is cached per shader (128 entries / 64 MiB total, 8 MiB per entry), so viewing several shaders does not repeatedly disassemble them. DXC loads only when requested, from the add-on's own `ModKit-tools/` folder.
+
+The texture browser previews an owned snapshot or replacement. **Capture CPU uploads** in **Session** is off by default; enable it to collect bytes and content IDs from newly observed uploads. Existing GPU-only resources remain session IDs until their contents are captured. The buffer browser shows the first 4 KiB as hexadecimal. **Snapshot GPU contents** reads buffers and base texture mips on Direct3D 9/10/11 and OpenGL, where ReShade abstracts synchronization implicitly. This explicit readback waits for the GPU and can stall a frame.
 
 Direct3D 12 and Vulkan previews use CPU uploads observed during creation, updates, mapping and staging-buffer-to-texture copies. GPU-only readback on these APIs needs additional per-subresource state and queue ownership tracking and is not implemented. Resources without captured bytes remain visible and can be replaced by session ID when their binding path is supported.
+
+## Persistent shader labels
+
+Select a shader in the shader browser or a captured draw, enter a **Label** such as `Sky shader` or `Car metal shader`, then click **Save labels**. Label edits stay in memory until saved. Clearing the label and saving removes it. Saved labels load on the next game run and appear in the shader browser, capture search, profiler summaries and exported frame TSV files.
+
+Labels are stored per game in `shader-labels.tsv`, using original shader bytecode hashes. Each non-comment line contains a 16-digit hexadecimal ID, a tab, and a UTF-8 label. They can be shared or edited while the game is closed. A game update that changes shader bytecode changes its hash, so the new shader may need a new label. Labels do not enable shader replacement or suppression.
+
+Games can also emit PIX render-pass markers and debug object names. Those describe engine events or objects and may be absent in retail builds. Receiving them requires native API interception; the public ReShade SDK does not expose marker callbacks. Native marker capture is not implemented in this release.
 
 ## Replacement files
 
@@ -48,6 +60,7 @@ reshade-modkit/GameExecutable/
   textures/<resource-id>.bin
   buffers/<resource-id>.bin
   rules.ini
+  shader-labels.tsv                   # Saved user labels keyed by shader hash
   captures/                          # Original exports and frame TSV files
 ```
 
@@ -86,6 +99,8 @@ Panel suppression switches are session controls; use `rules.ini` to persist a mo
 | --- | --- |
 | Draw/indexed/compute/mesh interception | ReShade events on the APIs that support each command |
 | Shader inspection/export | Shader code supplied through observed pipeline creation |
+| Saved shader labels | Per-game bytecode hash labels, shown in search, profiling and exports |
+| Shader disassembly | DXBC via D3DCompiler; DXIL via bundled DXC; GLSL source |
 | Shader replacement | Rebuildable raster/compute pipelines; old pipeline retained if creation fails |
 | Texture/buffer substitution | Direct pushed descriptors, vertex/index buffers and supported descriptor tables |
 | D3D12/Vulkan table substitution | Fully observed tables with at most 255 descriptors; unbounded, partially bound and static-sampler ranges are passed through |
@@ -108,7 +123,7 @@ OpenGL program replacements copy matching uniforms by name, including sampler un
 
 **Live capture**, **GPU timing**, and **Capture CPU uploads** are off by default. Idle draws bypass record construction; suppression uses cached shader IDs. When no replacement files exist, draws do not scan replacement resources or descriptor tables. Repeated pipeline, descriptor and table binds update existing state without rebuilding vectors. Tracking binding state and ReShade interception still have a CPU cost; actual BeamNG performance improvements need a game run.
 
-For GPU timings, open **Profiler**, enable **GPU timing**, then **Capture timed frame**. The checkbox initially requests a frame; if its commands were recorded before timing was enabled, capture again. **Frame / pipeline** shows `GPU ms`, offers sorting by cost, and exports timing values/status in TSV. The Profiler lists shader totals, averages, maxima and timed action counts. Each shader is credited with the entire draw using it, so totals across shader stages overlap. For profiling with fewer metadata costs, disable **Capture resource bindings**.
+For GPU timings, open **Profiler**, enable **GPU timing**, then **Capture timed frame**. The checkbox initially requests a frame; if its commands were recorded before timing was enabled, capture again. **Frame / pipeline** shows `GPU ms`, offers sorting by cost, and exports timing values/status in TSV. The Profiler lists shader totals, averages, maxima and timed action counts. Live timing displays the newest completed measured frame from a queue of at most four frames, so results can lag gameplay. Single frame captures display pending results until ready. Each shader is credited with the entire draw using it, so totals across shader stages overlap. For profiling with fewer metadata costs, disable **Capture resource bindings**.
 
 The add-on lazily installs its own D3D12 queue submission hook using MinHook. It injects two GPU timestamps around a replayed draw/dispatch, resolves them after the game's native submission into a separate readback buffer, and polls one fence per submission on later frames. Normal collection does not flush or wait for GPU idle. D3D12 `ExecuteIndirect`, bundles, and other APIs are currently untimed. Timestamp intervals are estimates influenced by pipeline overlap, GPU scheduling, and instrumentation; they are not isolated hardware execution costs.
 

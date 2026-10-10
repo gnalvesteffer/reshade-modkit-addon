@@ -8,12 +8,15 @@
 #include "modkit_pipeline.hpp"
 #include "modkit_opengl.hpp"
 #include "modkit_timing.hpp"
+#include "modkit_disassembly.hpp"
+#include "modkit_labels.hpp"
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -140,6 +143,7 @@ static size_t action_size(const draw_record &action)
 	return bytes;
 }
 struct file_info { std::filesystem::file_time_type time; uintmax_t size; uint64_t generation; };
+struct disassembly_entry { std::string text; uint64_t used = 0; };
 struct descriptor_key_hash
 {
 	size_t operator()(const std::pair<uint64_t, uint32_t> &key) const
@@ -160,6 +164,8 @@ struct device_state
 	std::filesystem::path root;
 	std::unordered_map<uint64_t, pipeline_info> pipelines;
 	std::map<uint64_t, shader_info> shaders;
+	shader_label_map shader_labels;
+	bool labels_dirty = false;
 	std::unordered_map<uint64_t, resource_info> resources;
 	std::unordered_map<uint64_t, view_info> views;
 	std::unordered_map<uint64_t, std::vector<layout_param_info>> layouts;
@@ -176,6 +182,8 @@ struct device_state
 	std::map<std::pair<uint64_t, uint64_t>, resource_view> replacement_views;
 	std::unordered_set<command_queue *> queues;
 	std::vector<draw_record> recording, frame;
+	std::deque<std::pair<uint64_t, std::vector<draw_record>>> timed_frames;
+	uint64_t displayed_frame_index = 0;
 	std::vector<draw_rule> rules;
 	std::unordered_set<uint64_t> suppressed_shaders, disabled_shaders;
 	std::map<std::filesystem::path, file_info> files;
@@ -193,8 +201,9 @@ struct device_state
 	char filter[128] = {};
 	std::array<char, 65536> editor = {};
 	std::filesystem::path editor_path;
-	std::string disassembly;
-	uint64_t disassembly_shader = 0;
+	std::unordered_map<uint64_t, disassembly_entry> disassemblies;
+	size_t disassembly_bytes = 0;
+	uint64_t disassembly_serial = 0;
 	std::string status = "Ready. Capture a frame to inspect the graphics pipeline.";
 	std::chrono::steady_clock::time_point last_poll;
 	bool gpu_timing = false, timing_hooked = false, expensive_first = false;
@@ -226,6 +235,11 @@ static const char *stage_name(pipeline_subobject_type stage)
 	case pipeline_subobject_type::pixel_shader: return "PS"; case pipeline_subobject_type::compute_shader: return "CS";
 	case pipeline_subobject_type::mesh_shader: return "MS"; case pipeline_subobject_type::amplification_shader: return "AS";
 	default: return "RT"; }
+}
+static std::string shader_caption(const device_state &s, uint64_t shader)
+{
+	const auto label = s.shader_labels.find(shader);
+	return label == s.shader_labels.end() ? hex_id(shader) : label->second + " [" + hex_id(shader) + "]";
 }
 static pipeline_stage stage_mask(pipeline_subobject_type stage)
 {
@@ -355,6 +369,9 @@ static void on_init_device(device *dev)
 	std::error_code ec;
 	for (const auto *folder : {"shaders", "textures", "buffers", "captures"}) std::filesystem::create_directories(state->root / folder, ec);
 	if (ec) state->status = "Cannot create mod directory: " + ec.message();
+	std::string label_error;
+	if (!load_shader_labels(state->root / "shader-labels.tsv", state->shader_labels, label_error))
+		report(*state, label_error.empty() ? "Could not read the saved shader labels." : label_error);
 	if (!std::filesystem::exists(state->root / "rules.ini", ec))
 	{
 		const char initial[] = "; Mod Kit draw rules. See MODKIT.md for syntax.\n; An empty file leaves all game draws unchanged.\n";
@@ -1328,11 +1345,31 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 {
 	std::lock_guard<std::recursive_mutex> lock(mutex);
 	auto s = find(queue->get_device()); if (!s) return;
-	if (s->recording_frame) { s->frame.swap(s->recording); s->recording.clear(); ++s->frame_index; }
+	if (s->recording_frame)
+	{
+		++s->frame_index;
+		if (s->gpu_timing && s->live)
+		{
+			s->timed_frames.emplace_back(s->frame_index, std::move(s->recording));
+			if (s->timed_frames.size() > 4) s->timed_frames.pop_front();
+		}
+		else { s->frame.swap(s->recording); s->displayed_frame_index = s->frame_index; }
+		s->recording.clear();
+	}
 	s->recording_frame = s->live || s->capture_next; s->capture_next = false;
 	const auto now = std::chrono::steady_clock::now();
 	advance_comparison(*s, now);
 	s->timing_pending.erase(std::remove_if(s->timing_pending.begin(), s->timing_pending.end(), [](auto &batch) { return collect_timing_readback(*batch); }), s->timing_pending.end());
+	// Live capture displays the newest completed measurements, not the newest
+	// submitted frame whose timestamps would still be pending every time.
+	for (auto it = s->timed_frames.begin(); it != s->timed_frames.end();)
+	{
+		if (it->first <= s->displayed_frame_index) { it = s->timed_frames.erase(it); continue; }
+		const bool complete = std::all_of(it->second.begin(), it->second.end(), [](const auto &action) { return !action.gpu || action.gpu->ready; });
+		if (complete)
+		{ s->displayed_frame_index = it->first; s->frame = std::move(it->second); it = s->timed_frames.erase(it); }
+		else ++it;
+	}
 	if (s->timing_hooked) update_timing_enabled();
 	if (s->reload_requested || (s->watch && now - s->last_poll > std::chrono::milliseconds(500))) { poll_files(*s); s->last_poll = now; }
 }
@@ -1531,7 +1568,32 @@ static void compile_editor(device_state &s, const shader_info &shader)
 }
 static void show_shader(device_state &s, shader_info &shader)
 {
-	ImGui::Text("%s %s (%zu bytes)", stage_name(shader.stage), hex_id(shader.hash).c_str(), shader.code.size());
+	ImGui::PushID(hex_id(shader.hash).c_str());
+	ImGui::Text("%s %s (%zu bytes)", stage_name(shader.stage), shader_caption(s, shader.hash).c_str(), shader.code.size());
+	char label[256] = {};
+	if (const auto it = s.shader_labels.find(shader.hash); it != s.shader_labels.end())
+		std::memcpy(label, it->second.data(), std::min(it->second.size(), sizeof(label) - 1));
+	if (ImGui::InputTextWithHint("Label", "Sky shader, car metal shader...", label, sizeof(label)))
+	{
+		if (s.shader_labels.size() < 8192 || s.shader_labels.count(shader.hash))
+		{
+			if (label[0]) s.shader_labels[shader.hash] = label; else s.shader_labels.erase(shader.hash);
+			s.labels_dirty = true;
+		}
+		else report(s, "Shader label limit reached (8192 labels).");
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Save labels"))
+	{
+		for (auto it = s.shader_labels.begin(); it != s.shader_labels.end();)
+		{
+			it->second = clean_shader_label(it->second);
+			if (it->second.empty()) it = s.shader_labels.erase(it); else ++it;
+		}
+		if (save_shader_labels(s.root / "shader-labels.tsv", s.shader_labels)) { s.labels_dirty = false; report(s, "Shader labels saved. They will be loaded on the next run."); }
+		else report(s, "Could not save shader-labels.tsv; edits remain in memory.");
+	}
+	if (s.labels_dirty) ImGui::TextDisabled("Label edits have not been saved yet.");
 	ImGui::BeginDisabled(s.comparison.active);
 	bool enabled = s.disabled_shaders.count(shader.hash) == 0;
 	if (ImGui::Checkbox("Enable replacement##shader", &enabled)) { if (enabled) s.disabled_shaders.erase(shader.hash); else s.disabled_shaders.insert(shader.hash); }
@@ -1558,20 +1620,36 @@ static void show_shader(device_state &s, shader_info &shader)
 	}
 	if (ImGui::CollapsingHeader("Shader disassembly/source"))
 	{
-		if (s.disassembly_shader != shader.hash)
+		if (!s.disassemblies.count(shader.hash))
 		{
-			s.disassembly_shader = shader.hash; s.disassembly.clear();
-			if (shader.extension == ".glsl") s.disassembly.assign(shader.code.begin(), shader.code.end());
+			std::string text;
+			if (shader.extension == ".glsl") text.assign(shader.code.begin(), shader.code.end());
 			else if (shader.extension == ".cso")
 			{
 				ID3DBlob *assembly = nullptr;
-				if (SUCCEEDED(D3DDisassemble(shader.code.data(), shader.code.size(), 0, nullptr, &assembly))) { s.disassembly.assign(static_cast<const char *>(assembly->GetBufferPointer()), assembly->GetBufferSize()); assembly->Release(); }
+				if (SUCCEEDED(D3DDisassemble(shader.code.data(), shader.code.size(), 0, nullptr, &assembly)) && assembly)
+					text.assign(static_cast<const char *>(assembly->GetBufferPointer()), assembly->GetBufferSize());
+				else if (disassemble_dxil(shader.code.data(), shader.code.size(), text))
+					text.insert(0, "; DXIL assembly. The original HLSL source is not reconstructed from compiled bytecode.\n\n");
+				if (assembly) assembly->Release();
 			}
-			if (s.disassembly.empty()) s.disassembly = "Use an external SPIR-V/DXIL disassembler for this shader format.";
+			if (text.size() > 8 * 1024 * 1024) text = "Shader disassembly exceeds the 8 MiB display limit.";
+			if (text.empty()) text = shader.extension == ".spv" ? "SPIR-V disassembly currently requires an external SPIR-V tool. Export the shader bytecode first." : "No readable source or disassembly is available for this shader.";
+			while (!s.disassemblies.empty() && (s.disassembly_bytes + text.size() > 64 * 1024 * 1024 || s.disassemblies.size() >= 128))
+			{
+				const auto oldest = std::min_element(s.disassemblies.begin(), s.disassemblies.end(), [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
+				s.disassembly_bytes -= oldest->second.text.size(); s.disassemblies.erase(oldest);
+			}
+			s.disassembly_bytes += text.size(); s.disassemblies.emplace(shader.hash, disassembly_entry {std::move(text), 0});
 		}
+		auto &assembly = s.disassemblies.at(shader.hash); assembly.used = ++s.disassembly_serial;
+		const bool retry = ImGui::Button("Retry disassembly");
+		ImGui::SameLine(); if (ImGui::Button("Export disassembly")) report(s, write_binary(s.root / "captures" / (hex_id(shader.hash) + ".asm.txt"), assembly.text.data(), assembly.text.size()) ? "Disassembly exported to captures/" : "Disassembly export failed");
 		ImGui::BeginChild("assembly", ImVec2(0, 230), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
-		ImGui::TextUnformatted(s.disassembly.c_str()); ImGui::EndChild();
+		ImGui::TextUnformatted(assembly.text.c_str()); ImGui::EndChild();
+		if (retry) { s.disassembly_bytes -= assembly.text.size(); s.disassemblies.erase(shader.hash); }
 	}
+	ImGui::PopID();
 }
 static void show_resource(effect_runtime *runtime, device_state &s, resource_info &info)
 {
@@ -1617,8 +1695,8 @@ static void show_resource(effect_runtime *runtime, device_state &s, resource_inf
 }
 static void export_frame(device_state &s)
 {
-	const auto path = s.root / "captures" / ("frame-" + std::to_string(s.frame_index) + ".tsv");
-	std::ofstream file(path); file << "event\tkind\tcount\tinstances\tfirst\tvertex_offset\tcommand\tskipped\tmodified\tshaders\tresources\tmarker\tgpu_ms\ttiming_status\n";
+	const auto path = s.root / "captures" / ("frame-" + std::to_string(s.displayed_frame_index) + ".tsv");
+	std::ofstream file(path); file << "event\tkind\tcount\tinstances\tfirst\tvertex_offset\tcommand\tskipped\tmodified\tshaders\tresources\tmarker\tgpu_ms\ttiming_status\tshader_labels\n";
 	for (size_t i = 0; i < s.frame.size(); ++i)
 	{
 		const auto &r = s.frame[i];
@@ -1628,7 +1706,9 @@ static void export_frame(device_state &s)
 		std::string marker = r.marker; std::replace(marker.begin(), marker.end(), '\t', ' '); std::replace(marker.begin(), marker.end(), '\n', ' ');
 		file << '\t' << marker << '\t';
 		if (r.gpu && r.gpu->ready && r.gpu->milliseconds >= 0) file << r.gpu->milliseconds;
-		file << '\t' << (r.skipped ? "suppressed" : !r.gpu ? "unavailable" : !r.gpu->ready ? "pending" : r.gpu->milliseconds < 0 ? "unavailable" : "ready") << '\n';
+		file << '\t' << (r.skipped ? "suppressed" : !r.gpu ? "unavailable" : !r.gpu->ready ? "pending" : r.gpu->milliseconds < 0 ? "unavailable" : "ready") << '\t';
+		for (auto shader : r.shaders) if (const auto label = s.shader_labels.find(shader); label != s.shader_labels.end()) file << clean_shader_label(label->second) << " [" << hex_id(shader) << "] ";
+		file << '\n';
 	}
 	report(s, file ? "Exported " + path.u8string() : "Frame export failed");
 }
@@ -1673,7 +1753,7 @@ static void show_profiler(effect_runtime *runtime, device_state &s)
 		ImGui::TableSetupColumn("Shader"); ImGui::TableSetupColumn("Timed draws"); ImGui::TableSetupColumn("Total ms"); ImGui::TableSetupColumn("Average ms"); ImGui::TableSetupColumn("Max ms"); ImGui::TableHeadersRow();
 		for (const auto &cost : sorted)
 		{
-			const auto label = hex_id(cost.shader); if (!matches_filter(s, label)) continue;
+			const auto label = shader_caption(s, cost.shader); if (!matches_filter(s, label)) continue;
 			ImGui::TableNextRow(); ImGui::TableNextColumn();
 			if (ImGui::Selectable(label.c_str(), s.selected_shader == cost.shader, ImGuiSelectableFlags_SpanAllColumns)) s.selected_shader = cost.shader;
 			ImGui::TableNextColumn(); ImGui::Text("%u", cost.count);
@@ -1685,7 +1765,7 @@ static void show_profiler(effect_runtime *runtime, device_state &s)
 	}
 	ImGui::SeparatorText("Suppression comparison");
 	auto &c = s.comparison;
-	ImGui::Text("Selected shader: %s", hex_id(s.selected_shader).c_str());
+	ImGui::Text("Selected shader: %s", shader_caption(s, s.selected_shader).c_str());
 	ImGui::BeginDisabled(c.active);
 	ImGui::SliderInt("Samples per phase", &c.samples_per_phase, 60, 600);
 	ImGui::EndDisabled();
@@ -1714,7 +1794,8 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 	ImGui::SameLine(); if (ImGui::Button("Export frame")) export_frame(s);
 	ImGui::Checkbox("Sort expensive draws first", &s.expensive_first);
 	ImGui::SameLine(); ImGui::Checkbox("Capture resource bindings", &s.detailed_resources);
-	ImGui::Text("Frame %llu: %zu actions%s", static_cast<unsigned long long>(s.frame_index), s.frame.size(), s.frame.size() == max_draws ? " (capture limit reached)" : "");
+	ImGui::Text("Frame %llu: %zu actions%s", static_cast<unsigned long long>(s.displayed_frame_index), s.frame.size(), s.frame.size() == max_draws ? " (capture limit reached)" : "");
+	if (!s.timed_frames.empty()) ImGui::TextDisabled("Waiting for GPU measurements: %zu newer frames", s.timed_frames.size());
 	const float list_width = std::max(240.0f, ImGui::GetContentRegionAvail().x * 0.44f);
 	ImGui::BeginChild("events", ImVec2(list_width, 450), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
 	if (ImGui::BeginTable("draw_list", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY))
@@ -1725,7 +1806,7 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 		for (size_t i : order)
 		{
 			const auto &record = s.frame[i]; std::string searchable = record.kind + " " + record.marker;
-			for (auto shader : record.shaders) searchable += " " + hex_id(shader);
+			for (auto shader : record.shaders) searchable += " " + shader_caption(s, shader);
 			for (auto &res : record.resources) searchable += " " + res.id;
 			if (!matches_filter(s, searchable)) continue;
 			ImGui::PushID(static_cast<int>(i)); ImGui::TableNextRow(); ImGui::TableNextColumn();
@@ -1786,7 +1867,7 @@ static void draw_panel(effect_runtime *runtime)
 		{
 			ImGui::BeginChild("shader_list", ImVec2(220, 400), ImGuiChildFlags_Borders); for (auto &entry : s.shaders)
 			{
-				const auto label = std::string(stage_name(entry.second.stage)) + " " + hex_id(entry.first);
+				const auto label = std::string(stage_name(entry.second.stage)) + " " + shader_caption(s, entry.first);
 				if (matches_filter(s, label) && ImGui::Selectable(label.c_str(), s.selected_shader == entry.first)) s.selected_shader = entry.first;
 			}
 			ImGui::EndChild(); ImGui::SameLine(); ImGui::BeginChild("shader_detail", ImVec2(0, 400), ImGuiChildFlags_Borders);

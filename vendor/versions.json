@@ -4,6 +4,12 @@
   "dependencies": {
     "imgui": "3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c",
     "stb": "28d546d5eb77d4585506a20480f4de2e706dff4c",
-    "minhook": "8fda4f5481fed5797dc2651cd91e238e9b3928c6"
+    "minhook": "8fda4f5481fed5797dc2651cd91e238e9b3928c6",
+    "dxc": {
+      "release": "v1.9.2609",
+      "asset": "dxc_2026_09_29.zip",
+      "sha256": "ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1",
+      "source": "https://github.com/microsoft/DirectXShaderCompiler"
+    }
   }
 }

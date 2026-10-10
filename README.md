@@ -4,6 +4,7 @@ A standalone ReShade add-on for inspecting and modding game graphics in real tim
 
 - Frame browser and pipeline/resource inspection.
 - Shader suppression, replacement, HLSL/GLSL editing and draw rules.
+- Persistent per-game shader labels and DXBC/DXIL disassembly.
 - Sampled texture and read-only buffer replacements with file watching.
 - **Optional D3D12 GPU timing**, expensive-draw sorting and shader cost summaries.
 - Automated shader suppression comparisons, with warmup and frame-time statistics.
@@ -12,7 +13,9 @@ Live capture, GPU timing, and CPU upload snapshots are **off by default**. The i
 
 ## Install
 
-Install ReShade with **full add-on support**, compatible with SDK API 20 / ImGui 1.92.5. Copy `ModKit.addon64` beside the game's ReShade DLL. Open **Home → Mod Kit**.
+Install ReShade with **full add-on support**, compatible with SDK API 20 / ImGui 1.92.5. Copy `ModKit.addon64` and the bundled `ModKit-tools` folder beside the game's ReShade DLL. Open **Home → Mod Kit**.
+
+Select a shader, enter a **Label**, and click **Save labels**. Labels appear in searches, shader details, profiling summaries and frame exports. They load from `reshade-modkit/<game>/shader-labels.tsv` on the next run; changed shader bytecode after a game update may need a new label.
 
 Use a single Mod Kit instance. If migrating from the old fork, replace its injector with a compatible ReShade build before loading this add-on. Existing `reshade-modkit/<game>/` files and rules are preserved.
 
@@ -21,6 +24,7 @@ Use a single Mod Kit instance. If migrating from the old fork, replace its injec
 ```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
+python scripts/fetch-dxc.py --destination build/Release
 ```
 
 Linux with MinGW:
@@ -28,6 +32,7 @@ Linux with MinGW:
 ```sh
 cmake -S . -B build-mingw -DCMAKE_TOOLCHAIN_FILE=mingw64.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build build-mingw --parallel
+python3 scripts/fetch-dxc.py --destination build-mingw
 ```
 
 See [MODKIT.md](MODKIT.md) for workflows, timing semantics, coverage and limits. Vendored SDK/dependency versions and original licenses are under [vendor](vendor).
