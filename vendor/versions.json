@@ -1,0 +1,9 @@
+{
+  "mod_kit_source": "ec6e91880120e7ba4090d34deea56449cd657ea3",
+  "reshade_sdk": "7bf9de8b33bcc76c3177007e65d73c72dd0f34c0",
+  "dependencies": {
+    "imgui": "3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c",
+    "stb": "28d546d5eb77d4585506a20480f4de2e706dff4c",
+    "minhook": "8fda4f5481fed5797dc2651cd91e238e9b3928c6"
+  }
+}

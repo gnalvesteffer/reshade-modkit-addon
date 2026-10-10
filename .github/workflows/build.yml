@@ -1,0 +1,35 @@
+name: Build add-on
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: microsoft/setup-msbuild@v3
+      - name: Build x64 add-on
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ModKit-addon-x64
+          path: |
+            build/Release/ModKit.addon64
+            README.md
+            MODKIT.md
+            LICENSE.md
+            vendor/versions.json
+            vendor/reshade/LICENSE.md
+            vendor/imgui/LICENSE.txt
+            vendor/stb/LICENSE
+            vendor/minhook/LICENSE.txt

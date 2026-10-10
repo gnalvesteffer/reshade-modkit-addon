@@ -1,0 +1,8 @@
+/build*/
+/bin/
+/.vs/
+*.addon32
+*.addon64
+*.obj
+*.pdb
+*.user
