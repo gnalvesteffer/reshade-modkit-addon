@@ -146,6 +146,9 @@ struct draw_record
 	std::vector<draw_resource> resources;
 	std::vector<std::string> output_targets;
 	bool back_buffer_target = false;
+	uint32_t output_target_count = 0;
+	uint32_t target_width = 0, target_height = 0, target_format = 0;
+	bool effect_target_valid = false;
 	bool modified = false, skipped = false;
 	std::string marker;
 	std::vector<viewport> viewports;
@@ -597,7 +600,7 @@ static void on_init_device(device *dev)
 	if (!load_effect_point(state->root / "effect-point.ini", state->early_effects))
 		state->early_status = "Invalid effect-point.ini; early effects disabled.";
 	else if (state->early_effects.enabled)
-		state->early_status = "Saved execution point loaded. Waiting for a matching back-buffer draw.";
+		state->early_status = "Saved execution point loaded. Waiting for a matching draw on the selected output.";
 	if (!std::filesystem::exists(state->root / "rules.ini", ec))
 	{
 		const char initial[] = "; Mod Kit draw rules. See MODKIT.md for syntax.\n; An empty file leaves all game draws unchanged.\n";
@@ -1485,12 +1488,25 @@ static draw_record make_draw_record(device *dev, device_state &s, command_state 
 	if (!s.recording_frame && !s.capture_next && !s.live) return record;
 	for (auto &label : command.markers) { if (!record.marker.empty()) record.marker += " / "; record.marker += label; }
 	record.viewports = command.viewports; record.scissors = command.scissors; record.dynamic_states = command.dynamic_states;
+	record.output_target_count = command.target_count;
 	for (uint32_t i = 0; i < command.target_count; ++i)
 	{
 		const auto target = dev->get_resource_from_view(command.targets[i]);
 		bool back_buffer = false;
 		for (const auto &runtime : s.runtimes) back_buffer |= runtime.first->get_current_back_buffer() == target;
 		record.back_buffer_target |= back_buffer;
+		if (i == 0)
+		{
+			const auto desc = dev->get_resource_desc(target);
+			if (desc.type == resource_type::texture_2d)
+			{
+				record.target_width = desc.texture.width;
+				record.target_height = desc.texture.height;
+				record.target_format = static_cast<uint32_t>(dev->get_resource_view_desc(command.targets[i]).format);
+				record.effect_target_valid = command.target_count == 1 && desc.texture.samples == 1 && desc.texture.depth_or_layers == 1 &&
+					format_to_default_typed(static_cast<format>(record.target_format), 0) != format::unknown;
+			}
+		}
 		if (auto info = s.resources.find(target.handle); info != s.resources.end())
 			record.output_targets.push_back(std::string(back_buffer ? "Back buffer: " : "Off-screen: ") + info->second.id);
 		else
@@ -1698,27 +1714,32 @@ static void render_effects_at_point(command_list *cmd, device_state &s, command_
 	auto dev = cmd->get_device();
 	const auto target = dev->get_resource_from_view(command.targets.front());
 	effect_runtime *runtime = nullptr;
-	for (auto &entry : s.runtimes) if (entry.first->get_current_back_buffer() == target) { runtime = entry.first; break; }
+	for (auto &entry : s.runtimes) if (entry.first->get_command_queue() == command.last_queue) { runtime = entry.first; break; }
 	if (!runtime)
-	{ s.early_status = "Waiting for the first matching draw to the current swap-chain back buffer. Off-screen UI targets are not supported."; return; }
+	{ s.early_status = "Waiting for a matching draw on ReShade's graphics queue."; return; }
 	if (s.runtimes.at(runtime).called) return;
-	if (command.last_queue != runtime->get_command_queue())
-	{ s.early_status = "Waiting for a matching command list with observed submission on ReShade's graphics queue."; return; }
+	const bool is_back_buffer = runtime->get_current_back_buffer() == target;
+	if (s.early_effects.back_buffer != is_back_buffer) return;
+	const auto desc = dev->get_resource_desc(target);
+	const auto target_format = dev->get_resource_view_desc(command.targets.front()).format;
+	if (!s.early_effects.back_buffer && (desc.type != resource_type::texture_2d || desc.texture.width != s.early_effects.target_width || desc.texture.height != s.early_effects.target_height || static_cast<uint32_t>(target_format) != s.early_effects.target_format)) return;
 	for (const auto &table : command.tables) for (auto entry : table.tables)
 	{
-		if (!entry.handle) { s.early_status = "A bound descriptor table is empty. Using normal ReShade timing."; return; }
+		if (!entry.handle) { s.early_status = "A bound descriptor table is empty. ReShade effects will be skipped this frame."; return; }
 		descriptor_heap heap = {}; dev->get_descriptor_heap_offset(entry, 0, 0, &heap, nullptr);
-		if (!heap.handle) { s.early_status = "A bound descriptor table cannot be restored. Using normal ReShade timing."; return; }
+		if (!heap.handle) { s.early_status = "A bound descriptor table cannot be restored. ReShade effects will be skipped this frame."; return; }
 	}
 	if (!runtime->get_effects_state()) { s.early_status = "ReShade effects are disabled."; return; }
-	const auto desc = dev->get_resource_desc(target);
-	if (desc.type != resource_type::texture_2d || desc.texture.samples != 1 || desc.texture.depth_or_layers != 1) return;
+	if (desc.type != resource_type::texture_2d || desc.texture.samples != 1 || desc.texture.depth_or_layers != 1)
+	{ s.early_status = "Selected target is not a single-sample 2D color texture; effects were skipped this frame."; return; }
+	uint32_t runtime_width = 0, runtime_height = 0; runtime->get_screenshot_width_and_height(&runtime_width, &runtime_height);
+	if (desc.texture.width != runtime_width || desc.texture.height != runtime_height)
+	{ s.early_status = "Selected target size differs from the ReShade output size; effects were skipped this frame."; return; }
 	auto views = s.effect_views.find(target.handle);
 	if (views == s.effect_views.end())
 	{
 		effect_target_views created;
-		const auto format = dev->get_resource_view_desc(command.targets.front()).format;
-		const auto linear = format_to_default_typed(format, 0), srgb = format_to_default_typed(format, 1);
+		const auto linear = format_to_default_typed(target_format, 0), srgb = format_to_default_typed(target_format, 1);
 		internal_scope guard;
 		if (!dev->create_resource_view(target, resource_usage::render_target, resource_view_desc(linear, 0, 1, 0, 1), &created.linear))
 		{ s.early_status = "Could not create the ReShade target view; ReShade effects will be skipped this frame."; return; }
@@ -1732,7 +1753,7 @@ static void render_effects_at_point(command_list *cmd, device_state &s, command_
 	auto &frame = s.runtimes.at(runtime); frame.called = true;
 	command.early_runtime = runtime; command.early_runtime_frame = frame.frame;
 	++s.early_effect_calls;
-	s.early_status = "ReShade effect rendering requested before the matching UI draw. The normal presentation pass is skipped.";
+	s.early_status = "ReShade effects ran before the selected draw on its output. The normal presentation pass is skipped.";
 	// ReShade takes its input lock here. Release our state lock so its overlay
 	// thread can enter Mod Kit without a lock inversion while effects are drawn.
 	lock.unlock();
@@ -1851,7 +1872,7 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 			auto *runtime = entry.first;
 			entry.second.called = true;
 			++s->early_effect_misses;
-			s->early_status = "No matching supported back-buffer draw this frame. ReShade effects were skipped to keep them off the UI; select a draw marked Back buffer.";
+			s->early_status = "No matching supported draw this frame. ReShade effects were skipped; check the selected shaders, output target, size, format and command-list support.";
 			lock.unlock();
 			{ internal_scope guard; runtime->render_effects(queue->get_immediate_command_list(), {}, {}); }
 			lock.lock();
@@ -2348,7 +2369,7 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 	if (!s.early_effects.shaders.empty())
 	{
 		std::string shaders; for (auto hash : s.early_effects.shaders) { if (!shaders.empty()) shaders += ", "; shaders += shader_caption(s, hash); }
-		ImGui::TextWrapped("Before the first matching %s draw: %s", s.early_effects.kind.c_str(), shaders.c_str());
+		ImGui::TextWrapped("Before the first matching %s draw to the %s output: %s", s.early_effects.kind.c_str(), s.early_effects.back_buffer ? "back-buffer" : "selected texture", shaders.c_str());
 		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12);
 		bool changed = ImGui::Checkbox("Enable early ReShade effects", &s.early_effects.enabled);
 		ImGui::SameLine(); changed |= ImGui::Checkbox("Match selected draw count", &s.early_effects.match_count);
@@ -2360,14 +2381,14 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 		if (changed)
 		{
 			++s.effect_point_generation;
-			s.early_status = s.early_effects.enabled ? "Waiting for newly recorded commands and the matching back-buffer draw." : "Early insertion disabled. ReShade resumes normal timing after affected commands are recorded again.";
+			s.early_status = s.early_effects.enabled ? "Waiting for a newly recorded matching draw on the selected output." : "Early insertion disabled. ReShade resumes normal timing after affected commands are recorded again.";
 			enable_effect_state_tracking(s);
 			if (!save_effect_point(s.root / "effect-point.ini", s.early_effects)) report(s, "Could not save the ReShade execution point; changes remain in memory.");
 		}
 	}
 	ImGui::TextWrapped("%s", s.early_status.c_str());
-	if (s.early_effect_calls || s.early_effect_misses) ImGui::TextDisabled("Early effect requests: %llu | Frames without a matching back-buffer draw: %llu", static_cast<unsigned long long>(s.early_effect_calls), static_cast<unsigned long long>(s.early_effect_misses));
-	ImGui::TextWrapped("Select a draw marked Back buffer at the point effects should run (after the scene and before the UI). Off-screen UI draws cannot trigger the pass. If no supported match occurs, ReShade effects are skipped for that frame so they do not cover the UI. Experimental D3D12 support; cached command lists and native render passes are not supported.");
+	if (s.early_effect_calls || s.early_effect_misses) ImGui::TextDisabled("Early effect requests: %llu | Frames without a matching draw: %llu", static_cast<unsigned long long>(s.early_effect_calls), static_cast<unsigned long long>(s.early_effect_misses));
+	ImGui::TextWrapped("Select the draw that starts the UI layer to run ReShade effects on its current output before the UI is drawn. Back-buffer and off-screen outputs are supported when they are a single-sample 2D color target at the ReShade output size. If no supported match occurs, ReShade effects are skipped for that frame. Experimental D3D12 support; cached command lists and native render passes are not supported.");
 	ImGui::Separator();
 	if (ImGui::Button("Capture next frame")) { s.capture_next = true; s.live = false; }
 	ImGui::SameLine(); ImGui::Checkbox("Live capture", &s.live);
@@ -2411,18 +2432,26 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 		if (record.output_targets.empty()) ImGui::TextDisabled("Output target was not captured. Capture a new frame to identify it.");
 		else for (const auto &target : record.output_targets) ImGui::TextWrapped("Output: %s", target.c_str());
 		ImGui::TextUnformatted("GPU ms:"); ImGui::SameLine(); show_gpu_time(record);
-		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12 || (record.kind != "draw" && record.kind != "indexed") || record.shaders.empty() || !record.back_buffer_target);
-		if (ImGui::Button("Execute ReShade effects before this back-buffer draw"))
+		uint32_t runtime_width = 0, runtime_height = 0; runtime->get_screenshot_width_and_height(&runtime_width, &runtime_height);
+		const bool supported_target = record.effect_target_valid && record.target_width == runtime_width && record.target_height == runtime_height;
+		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12 || (record.kind != "draw" && record.kind != "indexed") || record.shaders.empty() || !supported_target);
+		if (ImGui::Button("Run ReShade effects before this draw"))
 		{
 			s.early_effects = {true, false, record.kind, record.count, record.shaders};
+			s.early_effects.back_buffer = record.back_buffer_target;
+			s.early_effects.target_width = record.target_width;
+			s.early_effects.target_height = record.target_height;
+			s.early_effects.target_format = record.target_format;
 			std::sort(s.early_effects.shaders.begin(), s.early_effects.shaders.end());
 			++s.effect_point_generation;
-			s.early_status = "Execution point selected. Waiting for newly recorded commands and the matching back-buffer draw.";
+			s.early_status = "Execution point selected. Waiting for a newly recorded matching draw on the selected output.";
 			enable_effect_state_tracking(s);
 			report(s, save_effect_point(s.root / "effect-point.ini", s.early_effects) ? "ReShade execution point saved for this game." : "Could not save the execution point; it is active for this session.");
 		}
 		ImGui::EndDisabled();
-		if (!record.back_buffer_target) ImGui::TextWrapped("This draw does not write to the current swap-chain back buffer. Select a draw marked Back buffer at the point effects should run, after the scene and before the UI.");
+		if (record.output_target_count != 1) ImGui::TextWrapped("Early effects require exactly one color output target.");
+		else if (!record.effect_target_valid) ImGui::TextWrapped("This draw's output must be a single-sample 2D color texture.");
+		else if (record.target_width != runtime_width || record.target_height != runtime_height) ImGui::TextWrapped("This output is %ux%u, while ReShade is configured for %ux%u. Early effects require matching dimensions.", record.target_width, record.target_height, runtime_width, runtime_height);
 		if (!record.marker.empty()) ImGui::TextWrapped("%s", record.marker.c_str());
 		if (ImGui::CollapsingHeader("Shaders", ImGuiTreeNodeFlags_DefaultOpen))
 			for (auto hash : record.shaders) if (auto shader = s.shaders.find(hash); shader != s.shaders.end())

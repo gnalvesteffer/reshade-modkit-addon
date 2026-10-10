@@ -71,13 +71,18 @@ int main()
 		expect(load_shader_labels(labels_path, loaded_labels, error) && loaded_labels.at(2) == "Clouds", "BOM and CRLF labels");
 		const auto point_path = temporary.path / "effect-point.ini";
 		effect_point point {true, true, "indexed", 240, {UINT64_MAX, 1}}, loaded_point;
+		point.back_buffer = false; point.target_width = 1920; point.target_height = 1080; point.target_format = static_cast<uint32_t>(reshade::api::format::r8g8b8a8_unorm);
 		expect(save_effect_point(point_path, point) && load_effect_point(point_path, loaded_point), "Execution point round trip");
-		expect(loaded_point.enabled && loaded_point.match_count && loaded_point.count == 240 && loaded_point.shaders == std::vector<uint64_t>({1, UINT64_MAX}), "Execution point matching values");
+		expect(loaded_point.enabled && loaded_point.match_count && loaded_point.count == 240 && loaded_point.shaders == std::vector<uint64_t>({1, UINT64_MAX}) && !loaded_point.back_buffer && loaded_point.target_width == 1920 && loaded_point.target_height == 1080 && loaded_point.target_format == static_cast<uint32_t>(reshade::api::format::r8g8b8a8_unorm), "Execution point matching values");
 		for (const auto *invalid : {"kind=dispatch\nshaders=0000000000000001\n", "enabled=2\nkind=draw\nshaders=0000000000000001\n", "kind=draw\ncount=4294967296\nshaders=0000000000000001\n", "kind=draw\nshaders=garbage\n"})
 		{
 			put(point_path, invalid);
 			expect(!load_effect_point(point_path, loaded_point) && loaded_point.kind == "indexed", "Invalid execution point replaced previous settings");
 		}
+		put(point_path, "enabled=1\nkind=draw\nshaders=0000000000000001\n");
+		expect(load_effect_point(point_path, loaded_point) && loaded_point.back_buffer, "Legacy execution point defaults to back buffer");
+		put(point_path, "enabled=1\nkind=draw\ntarget=texture\ntarget_width=1920\ntarget_height=1080\nshaders=0000000000000001\n");
+		expect(!load_effect_point(point_path, loaded_point) && loaded_point.back_buffer, "Off-screen point without target format rejected");
 		expect(save_effect_point(point_path, {}) && !std::filesystem::exists(point_path), "Clear execution point");
 		D3D12_RESOURCE_BARRIER barrier {}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		barrier.Transition.pResource = reinterpret_cast<ID3D12Resource *>(uintptr_t(0x1234));

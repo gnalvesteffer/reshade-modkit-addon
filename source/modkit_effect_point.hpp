@@ -13,6 +13,10 @@ struct effect_point
 	std::string kind;
 	uint32_t count = 0;
 	std::vector<uint64_t> shaders;
+	// Old execution-point files did not include a target, so preserve their
+	// original back-buffer-only behavior when loading them.
+	bool back_buffer = true;
+	uint32_t target_width = 0, target_height = 0, target_format = 0;
 };
 inline bool load_effect_point(const std::filesystem::path &path, effect_point &point)
 {
@@ -39,9 +43,18 @@ inline bool load_effect_point(const std::filesystem::path &path, effect_point &p
 			(name == "enabled" ? loaded.enabled : loaded.match_count) = value == "1";
 		}
 		else if (name == "count") { if (!number(value, parsed) || parsed > UINT32_MAX) return false; loaded.count = static_cast<uint32_t>(parsed); }
+		else if (name == "target") { if (value == "back_buffer") loaded.back_buffer = true; else if (value == "texture") loaded.back_buffer = false; else return false; }
+		else if (name == "target_width" || name == "target_height" || name == "target_format")
+		{
+			if (!number(value, parsed) || parsed > UINT32_MAX) return false;
+			if (name == "target_width") loaded.target_width = static_cast<uint32_t>(parsed);
+			else if (name == "target_height") loaded.target_height = static_cast<uint32_t>(parsed);
+			else loaded.target_format = static_cast<uint32_t>(parsed);
+		}
 		else return false;
 	}
 	if (file.bad() || loaded.kind.empty() || loaded.shaders.empty()) return false;
+	if (!loaded.back_buffer && (!loaded.target_width || !loaded.target_height || !loaded.target_format)) return false;
 	std::sort(loaded.shaders.begin(), loaded.shaders.end());
 	loaded.shaders.erase(std::unique(loaded.shaders.begin(), loaded.shaders.end()), loaded.shaders.end());
 	point = std::move(loaded); return true;
@@ -49,9 +62,10 @@ inline bool load_effect_point(const std::filesystem::path &path, effect_point &p
 inline bool save_effect_point(const std::filesystem::path &path, const effect_point &point)
 {
 	if (point.shaders.empty()) { std::error_code ec; std::filesystem::remove(path, ec); return !ec; }
-	std::string text = "# Mod Kit early ReShade effects: first matching back-buffer draw.\n";
+	std::string text = "# Mod Kit early ReShade effects: first matching draw and output target.\n";
 	text += "enabled=" + std::to_string(point.enabled) + "\nkind=" + point.kind + "\nmatch_count=" + std::to_string(point.match_count) + "\ncount=" + std::to_string(point.count) + "\nshaders=";
 	for (auto shader : point.shaders) text += hex_id(shader) + ' ';
+	text += "\ntarget=" + std::string(point.back_buffer ? "back_buffer" : "texture") + "\ntarget_width=" + std::to_string(point.target_width) + "\ntarget_height=" + std::to_string(point.target_height) + "\ntarget_format=" + std::to_string(point.target_format);
 	text += '\n';
 	auto temporary = path; temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId());
 	if (!write_binary(temporary, text.data(), text.size())) return false;
