@@ -43,9 +43,18 @@ python3 scripts/fetch-dxc.py --destination build-mingw
 
 See [MODKIT.md](MODKIT.md) for workflows, timing semantics, coverage and limits. Vendored SDK/dependency versions and original licenses are under [vendor](vendor).
 
+## Repository skills
+
+Task-specific guidance for contributors and coding agents lives in [`.agents/skills/`](.agents/skills/README.md):
+
+- [Build and release](.agents/skills/addon-build-release/SKILL.md)
+- [Graphics capture debugging](.agents/skills/graphics-capture-debugging/SKILL.md)
+- [Shader and texture modding](.agents/skills/shader-texture-modding/SKILL.md)
+- [Deploying to a game](.agents/skills/game-deployment/SKILL.md)
+
 ## CI and releases
 
-GitHub Actions checks every push to `main` and every pull request. It builds the Windows x64 add-on, checks profile/label/execution-point persistence and texture preview guards, and validates the install layout and SHA256 manifests. Build artifacts include the raw add-on and an installable ZIP. These checks do not run a game or measure GPU performance.
+GitHub Actions runs on pushes to `main` and pull requests that change source, vendored dependencies, build configuration, packaging scripts or checks. Documentation-only and skill-only changes do not start a build. Version tags still run release checks, and `workflow_dispatch` can be used for a manual run. CI builds the Windows x64 add-on, checks profile/label/execution-point persistence and texture preview guards, and validates the install layout and SHA256 manifests. Build artifacts include the raw add-on and an installable ZIP. These checks do not run a game or measure GPU performance.
 
 To publish a version, push an annotated `vX.Y.Z` tag. The tag workflow repeats the checks and publishes the ZIP and its SHA256 file as a GitHub release after both jobs pass. Tags containing a hyphen, such as `v0.3.0-alpha.1`, publish a prerelease. Release jobs alone receive repository write permission.
 
