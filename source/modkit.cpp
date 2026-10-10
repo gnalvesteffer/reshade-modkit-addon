@@ -8,8 +8,10 @@
 #include "modkit_pipeline.hpp"
 #include "modkit_opengl.hpp"
 #include "modkit_timing.hpp"
+#include "modkit_texture.hpp"
 #include "modkit_disassembly.hpp"
 #include "modkit_labels.hpp"
+#include "modkit_effect_point.hpp"
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <algorithm>
@@ -65,6 +67,9 @@ struct resource_info
 	std::vector<uint8_t> captured; // Packed buffer, or packed base mip without row padding.
 	uint64_t attempted_generation = 0;
 	resource_view preview = {};
+	bool preview_requested = false;
+	std::string preview_note;
+	std::weak_ptr<texture_snapshot> pending_preview;
 	std::string error;
 };
 struct view_info { resource res = {}; resource_usage usage; resource_view_desc desc; };
@@ -98,6 +103,7 @@ struct table_binding
 	std::vector<uint32_t> dynamic_offsets;
 };
 struct vertex_binding { resource buffer = {}; uint64_t offset = 0; uint32_t stride = 0; };
+struct root_constants { pipeline_layout layout; std::vector<uint32_t> values; };
 struct draw_record;
 struct command_state
 {
@@ -107,6 +113,19 @@ struct command_state
 	std::map<uint32_t, vertex_binding> vertices;
 	resource index = {}; uint64_t index_offset = 0; uint32_t index_size = 0;
 	std::vector<resource_view> targets;
+	uint32_t target_count = 0;
+	resource_view depth_target = {};
+	bool in_render_pass = false;
+	uint32_t active_queries = 0;
+	std::vector<ID3D12DescriptorHeap *> native_heaps;
+	std::array<float, 4> native_blend {1, 1, 1, 1};
+	std::array<pipeline_layout, 2> root_layouts {};
+	std::map<std::pair<unsigned, uint32_t>, root_constants> constants;
+	uint64_t effect_point_generation = 0;
+	effect_runtime *early_runtime = nullptr;
+	uint64_t early_runtime_frame = 0;
+	command_queue *last_queue = nullptr;
+	std::vector<std::shared_ptr<texture_snapshot>> texture_copies;
 	std::vector<std::string> markers;
 	std::vector<viewport> viewports;
 	std::vector<rect> scissors;
@@ -144,6 +163,8 @@ static size_t action_size(const draw_record &action)
 }
 struct file_info { std::filesystem::file_time_type time; uintmax_t size; uint64_t generation; };
 struct disassembly_entry { std::string text; uint64_t used = 0; };
+struct early_runtime_state { uint64_t frame = 1; bool called = false; };
+struct effect_target_views { resource_view linear = {}, srgb = {}; };
 struct descriptor_key_hash
 {
 	size_t operator()(const std::pair<uint64_t, uint32_t> &key) const
@@ -166,6 +187,11 @@ struct device_state
 	std::map<uint64_t, shader_info> shaders;
 	shader_label_map shader_labels;
 	bool labels_dirty = false;
+	effect_point early_effects;
+	uint64_t effect_point_generation = 1, early_effect_calls = 0;
+	std::string early_status = "No execution point selected. ReShade renders effects before presentation.";
+	std::unordered_map<effect_runtime *, early_runtime_state> runtimes;
+	std::unordered_map<uint64_t, effect_target_views> effect_views;
 	std::unordered_map<uint64_t, resource_info> resources;
 	std::unordered_map<uint64_t, view_info> views;
 	std::unordered_map<uint64_t, std::vector<layout_param_info>> layouts;
@@ -201,6 +227,8 @@ struct device_state
 	char filter[128] = {};
 	std::array<char, 65536> editor = {};
 	std::filesystem::path editor_path;
+	bool editor_tab_requested = false;
+	std::string editor_note;
 	std::unordered_map<uint64_t, disassembly_entry> disassemblies;
 	size_t disassembly_bytes = 0;
 	uint64_t disassembly_serial = 0;
@@ -210,10 +238,95 @@ struct device_state
 	std::shared_ptr<size_t> timing_page_count = std::make_shared<size_t>(0);
 	std::vector<std::shared_ptr<timing_page>> timing_pool, untracked_timing_pages;
 	std::vector<std::shared_ptr<timing_submission>> timing_pending;
+	std::shared_ptr<texture_snapshot> texture_request;
+	std::vector<std::shared_ptr<texture_snapshot>> texture_snapshots;
 	uint64_t timing_dropped = 0;
 	suppression_comparison comparison;
 };
 static std::unordered_map<device *, std::unique_ptr<device_state>> devices;
+using native_heaps_call = void (STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, ID3D12DescriptorHeap *const *);
+using native_blend_call = void (STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, const FLOAT *);
+static std::unordered_map<void *, native_heaps_call> heap_hooks;
+static std::unordered_map<void *, native_blend_call> blend_hooks;
+static std::atomic<bool> native_state_enabled {false};
+static std::atomic<bool> native_texture_enabled {false};
+static std::atomic<bool> native_texture_requests {false};
+using native_barrier_call = void (STDMETHODCALLTYPE *)(ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *);
+static std::unordered_map<void *, native_barrier_call> barrier_hooks;
+static void STDMETHODCALLTYPE texture_barrier_hook(ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *);
+static bool install_texture_hook(command_list *cmd)
+{
+	if (cmd->get_device()->get_api() != device_api::d3d12) return false;
+	auto target = (*reinterpret_cast<void ***>(cmd->get_native()))[26];
+	std::lock_guard<std::mutex> lock(timing_hook_mutex);
+	if (barrier_hooks.count(target)) return true;
+	if (!timing_hooks_initialized)
+	{ if (MH_Initialize() != MH_OK) return false; timing_hooks_initialized = true; }
+	void *original = nullptr;
+	if (MH_CreateHook(target, reinterpret_cast<void *>(texture_barrier_hook), &original) != MH_OK) return false;
+	barrier_hooks.emplace(target, reinterpret_cast<native_barrier_call>(original));
+	if (MH_EnableHook(target) == MH_OK) return true;
+	barrier_hooks.erase(target); MH_RemoveHook(target); return false;
+}
+static void STDMETHODCALLTYPE effect_heaps_hook(ID3D12GraphicsCommandList *cmd, UINT count, ID3D12DescriptorHeap *const *heaps)
+{
+	native_heaps_call original;
+	{ std::lock_guard<std::mutex> lock(timing_hook_mutex); original = heap_hooks.at((*reinterpret_cast<void ***>(cmd))[28]); }
+	original(cmd, count, heaps);
+	if (internal_call || !native_state_enabled || count > 2) return;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	for (auto &entry : devices)
+		if (const auto found = entry.second->native_commands.find(reinterpret_cast<uintptr_t>(cmd)); found != entry.second->native_commands.end())
+		{
+			auto &state = entry.second->commands[found->second];
+			if (count) state.native_heaps.assign(heaps, heaps + count); else state.native_heaps.clear();
+			break;
+		}
+}
+static void STDMETHODCALLTYPE effect_blend_hook(ID3D12GraphicsCommandList *cmd, const FLOAT *blend)
+{
+	native_blend_call original;
+	{ std::lock_guard<std::mutex> lock(timing_hook_mutex); original = blend_hooks.at((*reinterpret_cast<void ***>(cmd))[23]); }
+	original(cmd, blend);
+	if (internal_call || !native_state_enabled || !blend) return;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	for (auto &entry : devices)
+		if (const auto found = entry.second->native_commands.find(reinterpret_cast<uintptr_t>(cmd)); found != entry.second->native_commands.end())
+		{ std::copy_n(blend, 4, entry.second->commands[found->second].native_blend.begin()); break; }
+}
+static bool install_effect_state_hooks(command_list *cmd)
+{
+	if (cmd->get_device()->get_api() != device_api::d3d12) return false;
+	auto vtable = *reinterpret_cast<void ***>(cmd->get_native());
+	std::lock_guard<std::mutex> lock(timing_hook_mutex);
+	if (!timing_hooks_initialized) { if (MH_Initialize() != MH_OK) return false; timing_hooks_initialized = true; }
+	if (heap_hooks.size() >= 32 || blend_hooks.size() >= 32) return false;
+	if (!heap_hooks.count(vtable[28]))
+	{
+		void *original = nullptr;
+		if (MH_CreateHook(vtable[28], reinterpret_cast<void *>(effect_heaps_hook), &original) != MH_OK) return false;
+		heap_hooks.emplace(vtable[28], reinterpret_cast<native_heaps_call>(original));
+		if (MH_EnableHook(vtable[28]) != MH_OK) { heap_hooks.erase(vtable[28]); MH_RemoveHook(vtable[28]); return false; }
+	}
+	if (!blend_hooks.count(vtable[23]))
+	{
+		void *original = nullptr;
+		if (MH_CreateHook(vtable[23], reinterpret_cast<void *>(effect_blend_hook), &original) != MH_OK) return false;
+		blend_hooks.emplace(vtable[23], reinterpret_cast<native_blend_call>(original));
+		if (MH_EnableHook(vtable[23]) != MH_OK) { blend_hooks.erase(vtable[23]); MH_RemoveHook(vtable[23]); return false; }
+	}
+	return true;
+}
+static bool enable_effect_state_tracking(device_state &s)
+{
+	if (s.early_effects.enabled)
+	{
+		for (const auto &entry : s.commands) if (!install_effect_state_hooks(entry.first))
+		{ s.early_effects.enabled = false; s.early_status = "Could not install D3D12 state hooks. Early effects disabled."; break; }
+	}
+	native_state_enabled = std::any_of(devices.begin(), devices.end(), [](const auto &entry) { return entry.second->early_effects.enabled; });
+	return s.early_effects.enabled;
+}
 static device_state *find(device *dev)
 {
 	const auto it = devices.find(dev);
@@ -240,6 +353,38 @@ static std::string shader_caption(const device_state &s, uint64_t shader)
 {
 	const auto label = s.shader_labels.find(shader);
 	return label == s.shader_labels.end() ? hex_id(shader) : label->second + " [" + hex_id(shader) + "]";
+}
+static command_state fresh_command_state(const device_state &s)
+{
+	command_state state;
+	if (s.early_effects.enabled)
+	{
+		state.effect_point_generation = s.effect_point_generation;
+		state.dynamic_states[dynamic_state::blend_constant] = UINT32_MAX;
+		state.dynamic_states[dynamic_state::front_stencil_reference_value] = 0;
+		state.dynamic_states[dynamic_state::back_stencil_reference_value] = 0;
+	}
+	return state;
+}
+static void on_init_runtime(effect_runtime *runtime)
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(runtime->get_device())) s->runtimes.emplace(runtime, early_runtime_state{});
+}
+static void on_destroy_runtime(effect_runtime *runtime)
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(runtime->get_device()))
+	{
+		s->runtimes.erase(runtime); ++s->effect_point_generation;
+		for (auto &entry : s->commands) if (entry.second.early_runtime == runtime) entry.second.early_runtime = nullptr;
+	}
+}
+static void on_runtime_present(effect_runtime *runtime)
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(runtime->get_device())) if (auto it = s->runtimes.find(runtime); it != s->runtimes.end())
+	{ ++it->second.frame; it->second.called = false; }
 }
 static pipeline_stage stage_mask(pipeline_subobject_type stage)
 {
@@ -326,25 +471,25 @@ static bool writable_resource(const resource_desc &desc)
 {
 	return (desc.usage & (resource_usage::render_target | resource_usage::depth_stencil | resource_usage::unordered_access | resource_usage::stream_output)) != resource_usage::undefined;
 }
-static void capture_data(device_state &state, resource_info &info, const subresource_data &data, bool force = false)
+static bool capture_data(device_state &state, resource_info &info, const subresource_data &data, bool force = false)
 {
-	if (!data.data || (!force && !state.capture_uploads)) return;
+	if (!data.data || (!force && !state.capture_uploads)) return false;
 	std::vector<uint8_t> bytes;
 	if (info.desc.type == resource_type::buffer)
 	{
-		if (info.desc.buffer.size > 64 * 1024 * 1024 || state.capture_bytes - info.captured.size() + info.desc.buffer.size > max_capture_bytes) return;
+		if (info.desc.buffer.size > 64 * 1024 * 1024 || state.capture_bytes - info.captured.size() + info.desc.buffer.size > max_capture_bytes) return false;
 		bytes.assign(static_cast<const uint8_t *>(data.data), static_cast<const uint8_t *>(data.data) + info.desc.buffer.size);
 	}
 	else if (info.desc.type == resource_type::texture_2d && info.desc.texture.samples == 1)
 	{
 		const uint32_t pitch = format_row_pitch(info.desc.texture.format, info.desc.texture.width);
 		const uint32_t size = format_slice_pitch(info.desc.texture.format, pitch, info.desc.texture.height);
-		if (!pitch || !size || size > 64 * 1024 * 1024 || data.row_pitch < pitch || state.capture_bytes - info.captured.size() + size > max_capture_bytes) return;
+		if (!pitch || !size || size > 64 * 1024 * 1024 || data.row_pitch < pitch || state.capture_bytes - info.captured.size() + size > max_capture_bytes) return false;
 		bytes.resize(size);
 		for (uint32_t row = 0; row < size / pitch; ++row)
 			std::memcpy(bytes.data() + row * pitch, static_cast<const uint8_t *>(data.data) + size_t(row) * data.row_pitch, pitch);
 	}
-	if (bytes.empty() || state.capture_bytes - info.captured.size() + bytes.size() > max_capture_bytes) return;
+	if (bytes.empty() || state.capture_bytes - info.captured.size() + bytes.size() > max_capture_bytes) return false;
 	state.capture_bytes -= info.captured.size(); state.capture_bytes += bytes.size();
 	info.captured = std::move(bytes);
 	uint64_t hash = hash_bytes(info.captured.data(), info.captured.size());
@@ -354,6 +499,80 @@ static void capture_data(device_state &state, resource_info &info, const subreso
 		info.desc.type == resource_type::buffer ? uint64_t(0) : uint64_t(info.desc.texture.depth_or_layers) };
 	hash = hash_bytes(dimensions, sizeof(dimensions), hash);
 	info.id = hex_id(hash); info.content_id = true; info.attempted_generation = 0;
+	return true;
+}
+
+static void update_texture_enabled()
+{
+	native_texture_enabled = std::any_of(devices.begin(), devices.end(), [](const auto &entry) { return !entry.second->texture_snapshots.empty(); });
+	native_texture_requests = std::any_of(devices.begin(), devices.end(), [](const auto &entry) { return bool(entry.second->texture_request); });
+}
+static void cancel_texture_request(device_state &s)
+{
+	if (!s.texture_request) return;
+	s.replacement_bytes -= s.texture_request->bytes;
+	s.texture_snapshots.erase(std::remove(s.texture_snapshots.begin(), s.texture_snapshots.end(), s.texture_request), s.texture_snapshots.end());
+	s.texture_request.reset(); update_texture_enabled();
+}
+static void STDMETHODCALLTYPE texture_barrier_hook(ID3D12GraphicsCommandList *cmd, UINT count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+	native_barrier_call original;
+	{ std::lock_guard<std::mutex> lock(timing_hook_mutex); original = barrier_hooks.at((*reinterpret_cast<void ***>(cmd))[26]); }
+	original(cmd, count, barriers);
+	if (internal_call || !native_texture_requests || !count) return;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	for (auto &entry : devices)
+	{
+		auto &s = *entry.second; const auto snapshot = s.texture_request;
+		if (!snapshot) continue;
+		const auto native = s.native_commands.find(reinterpret_cast<uintptr_t>(cmd)); if (native == s.native_commands.end()) continue;
+		auto &command = s.commands[native->second];
+		if (command.last_queue != snapshot->requested_queue || command.in_render_pass || command.active_queries || cmd->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+		// The final relevant barrier gives the exact state at this point. Do not
+		// sample a pending split transition or cross an aliasing operation.
+		for (UINT i = count; i-- > 0;)
+		{
+			const auto &barrier = barriers[i];
+			if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING) return;
+			if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || reinterpret_cast<uintptr_t>(barrier.Transition.pResource) != snapshot->source ||
+				(barrier.Transition.Subresource != 0 && barrier.Transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)) continue;
+			if (!snapshot_barrier(barrier, snapshot->source)) return;
+			internal_scope guard; record_texture_snapshot(cmd, barrier, *snapshot);
+			command.texture_copies.push_back(snapshot); s.texture_request.reset(); update_texture_enabled();
+			if (const auto resource = s.resources.find(snapshot->source); resource != s.resources.end())
+				resource->second.preview_note = "GPU snapshot recorded. Waiting for submission and completion.";
+			return;
+		}
+	}
+}
+static void collect_texture_snapshots(device_state &s)
+{
+	for (const auto &snapshot : s.texture_snapshots)
+	{
+		if (snapshot->captured) continue;
+		if (snapshot->failed)
+		{
+			snapshot->captured = true;
+			if (const auto found = s.resources.find(snapshot->source); found != s.resources.end() && found->second.pending_preview.lock() == snapshot)
+				found->second.preview_note = "GPU snapshot failed or its commands were discarded. Click refresh to retry.";
+			continue;
+		}
+		if (!snapshot->recorded || !snapshot->fence_value) continue;
+		const auto completed = snapshot->fence.ptr->GetCompletedValue();
+		if (completed == UINT64_MAX) { snapshot->failed = true; continue; }
+		if (completed < snapshot->fence_value) continue;
+		snapshot->captured = true;
+		const auto found = s.resources.find(snapshot->source);
+		if (found == s.resources.end() || found->second.serial != snapshot->serial || found->second.pending_preview.lock() != snapshot) continue;
+		auto &info = found->second;
+		void *mapped = nullptr; D3D12_RANGE read {0, static_cast<SIZE_T>(snapshot->bytes)};
+		if (FAILED(snapshot->readback.ptr->Map(0, &read, &mapped))) { info.preview_note = "GPU snapshot mapping failed. Retry the preview."; continue; }
+		const bool captured = capture_data(s, info, {static_cast<uint8_t *>(mapped) + snapshot->footprint.Offset, snapshot->footprint.Footprint.RowPitch, static_cast<uint32_t>(snapshot->bytes)}, true);
+		D3D12_RANGE written {0, 0}; snapshot->readback.ptr->Unmap(0, &written);
+		if (!captured)
+			info.preview_note = "Snapshot could not fit within the CPU capture limit.";
+		else { info.preview = {}; info.preview_note = "GPU snapshot ready. Refresh to capture a later transition."; }
+	}
 }
 
 static void on_init_device(device *dev)
@@ -372,6 +591,10 @@ static void on_init_device(device *dev)
 	std::string label_error;
 	if (!load_shader_labels(state->root / "shader-labels.tsv", state->shader_labels, label_error))
 		report(*state, label_error.empty() ? "Could not read the saved shader labels." : label_error);
+	if (!load_effect_point(state->root / "effect-point.ini", state->early_effects))
+		state->early_status = "Invalid effect-point.ini; early effects disabled.";
+	else if (state->early_effects.enabled)
+		state->early_status = "Saved execution point loaded. Waiting for a matching back-buffer draw.";
 	if (!std::filesystem::exists(state->root / "rules.ini", ec))
 	{
 		const char initial[] = "; Mod Kit draw rules. See MODKIT.md for syntax.\n; An empty file leaves all game draws unchanged.\n";
@@ -385,7 +608,7 @@ static void on_init_queue(command_queue *queue)
 	if (auto s = find(queue->get_device()))
 	{
 		s->queues.insert(queue);
-		if (s->timing_hooked && queue->get_device()->get_api() == device_api::d3d12 && !install_timing_hook(queue))
+		if ((s->timing_hooked || !s->texture_snapshots.empty()) && queue->get_device()->get_api() == device_api::d3d12 && !install_timing_hook(queue))
 		{ s->gpu_timing = false; report(*s, "GPU timing stopped: could not track a new D3D12 queue."); }
 	}
 }
@@ -395,12 +618,18 @@ static void on_destroy_queue(command_queue *queue)
 	if (auto s = find(queue->get_device()))
 	{
 		const auto native = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
-		if (!s->timing_pending.empty() || !s->untracked_timing_pages.empty()) queue->wait_idle();
+		if (!s->timing_pending.empty() || !s->untracked_timing_pages.empty() || !s->texture_snapshots.empty()) queue->wait_idle();
+		collect_texture_snapshots(*s);
+		if (s->texture_request && s->texture_request->requested_queue == queue) cancel_texture_request(*s);
+		for (auto &snapshot : s->texture_snapshots)
+			if (snapshot->last_queue == native) snapshot->last_queue = nullptr;
+		update_texture_enabled();
 		s->timing_pending.erase(std::remove_if(s->timing_pending.begin(), s->timing_pending.end(), [&](auto &batch) {
 			if (batch->queue != native) return false;
 			collect_timing_readback(*batch); return true;
 		}), s->timing_pending.end());
 		s->queues.erase(queue);
+		for (auto &entry : s->commands) if (entry.second.last_queue == queue) entry.second.last_queue = nullptr;
 	}
 }
 static void on_destroy_device(device *dev)
@@ -413,16 +642,25 @@ static void on_destroy_device(device *dev)
 	for (auto view : s->owned_views) dev->destroy_resource_view(view);
 	for (auto pipe : s->owned_pipelines) dev->destroy_pipeline(pipe);
 	for (auto res : s->owned_resources) dev->destroy_resource(res);
+	for (auto &entry : s->effect_views)
+	{
+		dev->destroy_resource_view(entry.second.linear);
+		if (entry.second.srgb != entry.second.linear) dev->destroy_resource_view(entry.second.srgb);
+	}
 	devices.erase(dev);
 	update_timing_enabled();
+	update_texture_enabled();
+	native_state_enabled = std::any_of(devices.begin(), devices.end(), [](const auto &entry) { return entry.second->early_effects.enabled; });
 }
 static void on_init_command(command_list *cmd)
 {
 	std::lock_guard<std::recursive_mutex> lock(mutex);
 	if (auto s = find(cmd->get_device()))
 	{
-		s->commands.emplace(cmd, command_state{});
+		s->commands.emplace(cmd, fresh_command_state(*s));
 		if (cmd->get_device()->get_api() == device_api::d3d12) s->native_commands[cmd->get_native()] = cmd;
+		if (s->early_effects.enabled) enable_effect_state_tracking(*s);
+		if (s->texture_request && !install_texture_hook(cmd)) report(*s, "Could not install preview tracking for a new command list.");
 	}
 }
 static void on_reset_command(command_list *cmd)
@@ -431,7 +669,10 @@ static void on_reset_command(command_list *cmd)
 	if (auto s = find(cmd->get_device()))
 	{
 		for (const auto &action : s->commands[cmd].actions) s->action_bytes -= action_size(action);
-		s->commands[cmd] = {};
+		const auto last_queue = s->commands[cmd].last_queue;
+		for (const auto &snapshot : s->commands[cmd].texture_copies)
+			if (!snapshot->fence_value) snapshot->failed = true; // Discarded before submission.
+		s->commands[cmd] = fresh_command_state(*s); s->commands[cmd].last_queue = last_queue;
 	}
 }
 static void on_destroy_command(command_list *cmd)
@@ -452,13 +693,48 @@ static void on_secondary(command_list *cmd, command_list *secondary)
 	if (auto found = s->commands.find(secondary); found != s->commands.end()) for (const auto &action : found->second.actions)
 		if (actions.size() < max_draws && s->action_bytes + action_size(action) <= 64 * 1024 * 1024) { actions.push_back(action); s->action_bytes += action_size(action); }
 	// Secondary command buffers may invalidate parent bindings. Preserve the recorded actions.
+	const auto runtime = primary.early_runtime; const auto frame = primary.early_runtime_frame;
+	const auto queue = primary.last_queue;
+	const auto in_render_pass = primary.in_render_pass; const auto active_queries = primary.active_queries;
+	auto texture_copies = std::move(primary.texture_copies);
 	primary = {}; primary.actions = std::move(actions);
+	primary.early_runtime = runtime; primary.early_runtime_frame = frame; primary.last_queue = queue;
+	primary.texture_copies = std::move(texture_copies);
+	primary.in_render_pass = in_render_pass; primary.active_queries = active_queries;
 }
 static void on_execute(command_queue *queue, command_list *cmd)
 {
 	if (internal_call) return;
-	std::lock_guard<std::recursive_mutex> lock(mutex);
+	std::unique_lock<std::recursive_mutex> lock(mutex);
 	auto s = find(queue->get_device()); if (!s || !explicit_api(queue->get_device())) return;
+	if (const auto command = s->commands.find(cmd); command != s->commands.end()) command->second.last_queue = queue;
+	if (auto found = s->commands.find(cmd); found != s->commands.end() && found->second.early_runtime)
+	{
+		const auto runtime = found->second.early_runtime;
+		if (auto frame = s->runtimes.find(runtime); frame != s->runtimes.end())
+		{
+			if (found->second.early_runtime_frame != frame->second.frame || runtime->get_command_queue() != queue)
+			{
+				s->early_status = "A reused or different-queue command list contains ReShade effects. Early insertion disabled; re-record commands or restart before reloading effects.";
+				if (s->early_effects.enabled)
+				{
+					s->early_effects.enabled = false; ++s->effect_point_generation;
+					enable_effect_state_tracking(*s);
+					save_effect_point(s->root / "effect-point.ini", s->early_effects);
+				}
+			}
+			if (!frame->second.called)
+			{
+				frame->second.called = true;
+				// Commands with an already recorded effect pass must not get a second
+				// pass over the UI at presentation. A zero-view call updates uniforms
+				// and suppresses the default pass without recording any GPU commands.
+				lock.unlock();
+				{ internal_scope guard; runtime->render_effects(queue->get_immediate_command_list(), {}, {}); }
+				lock.lock();
+			}
+		}
+	}
 	if (!s->recording_frame && !s->comparison.active) return;
 	if (auto found = s->commands.find(cmd); found != s->commands.end())
 		for (const auto &action : found->second.actions)
@@ -473,14 +749,32 @@ static void STDMETHODCALLTYPE timing_execute_hook(ID3D12CommandQueue *queue, UIN
 {
 	auto original = timing_original(queue);
 	if (!original) return; // Hooks are removed only at process shutdown.
-	if (!native_timing_enabled) { original(queue, count, lists); return; }
+	if (!native_timing_enabled && !native_texture_enabled) { original(queue, count, lists); return; }
 	// Keep resolves adjacent to their native submission, including concurrent callers.
 	std::lock_guard<std::recursive_mutex> submission_lock(timing_submit_mutex);
 	std::lock_guard<std::recursive_mutex> lock(mutex);
 	device_state *s = nullptr;
 	for (auto &device : devices) for (auto candidate : device.second->queues)
 		if (candidate->get_device()->get_api() == device_api::d3d12 && candidate->get_native() == reinterpret_cast<uintptr_t>(queue)) s = device.second.get();
-	if (!s || !s->timing_hooked) { original(queue, count, lists); return; }
+	if (!s) { original(queue, count, lists); return; }
+	std::vector<std::shared_ptr<texture_snapshot>> textures;
+	if (native_texture_enabled)
+		for (UINT i = 0; i < count; ++i)
+			if (const auto native = s->native_commands.find(reinterpret_cast<uintptr_t>(lists[i])); native != s->native_commands.end())
+				for (const auto &snapshot : s->commands[native->second].texture_copies)
+					if (std::find(textures.begin(), textures.end(), snapshot) == textures.end()) textures.push_back(snapshot);
+	for (const auto &snapshot : textures)
+		if (snapshot->fence_value && snapshot->last_queue && snapshot->last_queue != queue && snapshot->fence.ptr->GetCompletedValue() < snapshot->fence_value)
+			if (FAILED(queue->Wait(snapshot->fence.ptr, snapshot->fence_value))) snapshot->failed = true;
+	const auto signal_textures = [&] {
+		for (const auto &snapshot : textures)
+		{
+			snapshot->last_queue = queue;
+			if (FAILED(queue->Signal(snapshot->fence.ptr, ++snapshot->fence_value))) snapshot->failed = true;
+		}
+	};
+	if (!s->timing_hooked || !native_timing_enabled)
+	{ original(queue, count, lists); signal_textures(); return; }
 	auto batch = std::make_shared<timing_submission>();
 	std::set<std::pair<timing_page *, uint32_t>> observed;
 	std::unordered_set<timing_page *> retained;
@@ -511,6 +805,7 @@ static void STDMETHODCALLTYPE timing_execute_hook(ID3D12CommandQueue *queue, UIN
 		if (page->last_fence.ptr && page->last_queue != queue && page->last_fence.ptr->GetCompletedValue() == 0)
 			queue->Wait(page->last_fence.ptr, 1);
 	original(queue, count, lists);
+	signal_textures();
 	if (batch->retained_pages.empty()) return;
 	if (duplicate)
 	{
@@ -614,6 +909,15 @@ static void on_destroy_resource(device *dev, resource res)
 {
 	if (internal_call) return;
 	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(dev); s && s->texture_request && s->texture_request->source == res.handle)
+	{ cancel_texture_request(*s); }
+	if (auto s = find(dev)) if (const auto views = s->effect_views.find(res.handle); views != s->effect_views.end())
+	{
+		internal_scope guard;
+		dev->destroy_resource_view(views->second.linear);
+		if (views->second.srgb != views->second.linear) dev->destroy_resource_view(views->second.srgb);
+		s->effect_views.erase(views);
+	}
 	if (auto s = find(dev)) if (auto it = s->resources.find(res.handle); it != s->resources.end())
 	{
 		s->capture_bytes -= it->second.captured.size(); s->resources.erase(it);
@@ -798,6 +1102,22 @@ static void on_bind_tables(command_list *cmd, shader_stage stages, pipeline_layo
 	if (internal_call || count > 128) return;
 	std::lock_guard<std::recursive_mutex> lock(mutex);
 	auto s = find(cmd->get_device()); if (!s) return;
+	if (cmd->get_device()->get_api() == device_api::d3d12)
+	{
+		auto &command = s->commands[cmd];
+		if (!count && !layout.handle && stages == shader_stage::all)
+		{
+			command.native_heaps.clear(); command.native_blend = {};
+			command.viewports.clear(); command.scissors.clear();
+		}
+		for (unsigned group = 0; group < 2; ++group)
+		{
+			const auto mask = group ? shader_stage::all_compute | shader_stage::all_ray_tracing : shader_stage::all_graphics;
+			if ((stages & mask) == shader_stage{} || command.root_layouts[group] == layout) continue;
+			command.root_layouts[group] = layout;
+			for (auto it = command.constants.begin(); it != command.constants.end();) if (it->first.first == group) it = command.constants.erase(it); else ++it;
+		}
+	}
 	auto &out = s->commands[cmd].tables;
 	if (count == 1 && offset_count == 0)
 		for (auto &old : out)
@@ -852,12 +1172,58 @@ static void on_targets(command_list *cmd, uint32_t count, const resource_view *v
 {
 	if (internal_call || count > 32) return;
 	std::lock_guard<std::recursive_mutex> lock(mutex);
-	if (auto s = find(cmd->get_device())) { auto &targets = s->commands[cmd].targets; targets.clear(); if (count) targets.assign(views, views + count); if (depth.handle) targets.push_back(depth); }
+	if (auto s = find(cmd->get_device()))
+	{
+		auto &command = s->commands[cmd]; command.target_count = count; command.depth_target = depth;
+		auto &targets = command.targets; targets.clear(); if (count) targets.assign(views, views + count); if (depth.handle) targets.push_back(depth);
+	}
 }
 static bool on_render_pass(command_list *cmd, uint32_t count, const render_pass_render_target_desc *targets, const render_pass_depth_stencil_desc *depth, render_pass_flags)
 {
+	if (internal_call) return false;
 	std::vector<resource_view> views; for (uint32_t i = 0; i < count; ++i) views.push_back(targets[i].view);
-	on_targets(cmd, count, views.data(), depth ? depth->view : resource_view{}); return false;
+	on_targets(cmd, count, views.data(), depth ? depth->view : resource_view{});
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(cmd->get_device())) s->commands[cmd].in_render_pass = true;
+	return false;
+}
+static bool on_end_render_pass(command_list *cmd)
+{
+	if (internal_call) return false;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(cmd->get_device())) s->commands[cmd].in_render_pass = false;
+	return false;
+}
+static void on_constants(command_list *cmd, shader_stage stages, pipeline_layout layout, uint32_t param, uint32_t first, uint32_t count, const void *values)
+{
+	if (internal_call || first > 64 || count > 64 - first || param >= 64 || !values) return;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	auto s = find(cmd->get_device()); if (!s || !s->early_effects.enabled || cmd->get_device()->get_api() != device_api::d3d12) return;
+	auto &command = s->commands[cmd];
+	if (command.effect_point_generation != s->effect_point_generation) return;
+	for (unsigned group = 0; group < 2; ++group)
+	{
+		const auto mask = group ? shader_stage::all_compute | shader_stage::all_ray_tracing : shader_stage::all_graphics;
+		if ((stages & mask) == shader_stage{}) continue;
+		auto &constant = command.constants[{group, param}];
+		if (constant.layout != layout) { constant.layout = layout; constant.values.clear(); }
+		constant.values.resize(std::max<size_t>(constant.values.size(), first + count));
+		std::memcpy(constant.values.data() + first, values, count * sizeof(uint32_t));
+	}
+}
+static bool on_begin_query(command_list *cmd, query_heap, query_type, uint32_t)
+{
+	if (internal_call) return false;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(cmd->get_device())) ++s->commands[cmd].active_queries;
+	return false;
+}
+static bool on_end_query(command_list *cmd, query_heap, query_type type, uint32_t)
+{
+	if (internal_call || type == query_type::timestamp) return false;
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (auto s = find(cmd->get_device()); s && s->commands[cmd].active_queries) --s->commands[cmd].active_queries;
+	return false;
 }
 
 static bool file_present(device_state &s, const std::filesystem::path &path) { return s.files.count(path) != 0; }
@@ -1245,13 +1611,133 @@ struct draw_override
 	}
 };
 
+static command_state copy_effect_state(const command_state &command)
+{
+	command_state copy;
+	copy.pipelines = command.pipelines; copy.pushed = command.pushed; copy.tables = command.tables;
+	copy.vertices = command.vertices; copy.index = command.index; copy.index_offset = command.index_offset; copy.index_size = command.index_size;
+	copy.targets = command.targets; copy.target_count = command.target_count; copy.depth_target = command.depth_target;
+	copy.viewports = command.viewports; copy.scissors = command.scissors; copy.dynamic_states = command.dynamic_states;
+	copy.root_layouts = command.root_layouts; copy.constants = command.constants;
+	copy.native_heaps = command.native_heaps; copy.native_blend = command.native_blend;
+	return copy;
+}
+static void restore_effect_state(command_list *cmd, const command_state &state)
+{
+	// Root signature and heap changes invalidate root tables. Set both layouts,
+	// settle both descriptor heaps, then restore every table and root argument.
+	for (unsigned group = 0; group < 2; ++group)
+		cmd->bind_descriptor_tables(group ? shader_stage::all_compute | shader_stage::all_ray_tracing : shader_stage::all_graphics, state.root_layouts[group], 0, 0, nullptr);
+	for (unsigned pass = 0; pass < 2; ++pass)
+		for (const auto &table : state.tables)
+			cmd->bind_descriptor_tables2(table.stages, table.layout, table.first, static_cast<uint32_t>(table.tables.size()), table.tables.data(), static_cast<uint32_t>(table.dynamic_offsets.size()), table.dynamic_offsets.data());
+	for (const auto &push : state.pushed)
+	{
+		auto update = push.update; update.descriptors = descriptor_pointer(push.value);
+		cmd->push_descriptors(push.stages, push.layout, push.param, update);
+	}
+	for (const auto &constant : state.constants)
+		if (!constant.second.values.empty()) cmd->push_constants(constant.first.first ? shader_stage::all_compute | shader_stage::all_ray_tracing : shader_stage::all_graphics, constant.second.layout, constant.first.second, 0, static_cast<uint32_t>(constant.second.values.size()), constant.second.values.data());
+	for (const auto &pipeline : state.pipelines) cmd->bind_pipeline(pipeline.stages, pipeline.handle);
+	std::vector<dynamic_state> states; std::vector<uint32_t> values;
+	for (const auto &dynamic : state.dynamic_states) { states.push_back(dynamic.first); values.push_back(dynamic.second); }
+	if (!states.empty()) cmd->bind_pipeline_states(static_cast<uint32_t>(states.size()), states.data(), values.data());
+	auto native = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
+	// Force the SDK to notice at least one original heap even for bindless root
+	// signatures with no tables. Shader stage zero updates heaps only.
+	std::vector<descriptor_table> heap_tables;
+	for (auto heap : state.native_heaps) heap_tables.push_back({heap->GetGPUDescriptorHandleForHeapStart().ptr});
+	cmd->bind_descriptor_tables(shader_stage{}, {}, 0, static_cast<uint32_t>(heap_tables.size()), heap_tables.data());
+	native->SetDescriptorHeaps(static_cast<UINT>(state.native_heaps.size()), state.native_heaps.data());
+	// Changing heaps invalidates tables. Rebind their original GPU handles after
+	// the exact native heap set has been restored, including bindless-only sets.
+	for (const auto &table : state.tables) for (uint32_t i = 0; i < table.tables.size(); ++i)
+	{
+		descriptor_heap heap = {}; uint32_t offset = 0;
+		cmd->get_device()->get_descriptor_heap_offset(table.tables[i], 0, 0, &heap, &offset);
+		auto original_heap = reinterpret_cast<ID3D12DescriptorHeap *>(heap.handle);
+		if (!original_heap) continue;
+		auto handle = original_heap->GetGPUDescriptorHandleForHeapStart();
+		handle.ptr += uint64_t(offset) * reinterpret_cast<ID3D12Device *>(cmd->get_device()->get_native())->GetDescriptorHandleIncrementSize(original_heap->GetDesc().Type);
+		if ((table.stages & shader_stage::all_graphics) != shader_stage{}) native->SetGraphicsRootDescriptorTable(table.first + i, handle);
+		if ((table.stages & (shader_stage::all_compute | shader_stage::all_ray_tracing)) != shader_stage{}) native->SetComputeRootDescriptorTable(table.first + i, handle);
+	}
+	native->OMSetBlendFactor(state.native_blend.data());
+	cmd->bind_render_targets_and_depth_stencil(state.target_count, state.targets.data(), state.depth_target);
+	cmd->bind_viewports(0, static_cast<uint32_t>(state.viewports.size()), state.viewports.data());
+	cmd->bind_scissor_rects(0, static_cast<uint32_t>(state.scissors.size()), state.scissors.data());
+	for (const auto &vertex : state.vertices) if (vertex.second.buffer.handle)
+		cmd->bind_vertex_buffers(vertex.first, 1, &vertex.second.buffer, &vertex.second.offset, &vertex.second.stride);
+	cmd->bind_index_buffer(state.index, state.index_offset, state.index_size);
+}
+static void render_effects_at_point(command_list *cmd, device_state &s, command_state &command, const char *kind, uint32_t count, std::unique_lock<std::recursive_mutex> &lock)
+{
+	if (!s.early_effects.enabled || cmd->get_device()->get_api() != device_api::d3d12 || s.early_effects.kind != kind || (s.early_effects.match_count && s.early_effects.count != count)) return;
+	const auto &shaders = bound_shaders(s, command, false);
+	if (shaders.size() != s.early_effects.shaders.size() || !std::all_of(s.early_effects.shaders.begin(), s.early_effects.shaders.end(), [&](uint64_t hash) { return std::find(shaders.begin(), shaders.end(), hash) != shaders.end(); })) return;
+	if (command.effect_point_generation != s.effect_point_generation)
+	{ s.early_status = "Waiting for the game to record this command list again."; return; }
+	if (command.in_render_pass || command.active_queries || reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native())->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+	{ s.early_status = "Matching draw is inside a render pass/query or a non-direct command list; using normal ReShade timing."; return; }
+	if (command.target_count != 1 || !command.root_layouts[0].handle || command.pipelines.empty() || command.native_heaps.empty() || command.viewports.empty() || command.scissors.empty() || !command.dynamic_states.count(dynamic_state::primitive_topology))
+	{ s.early_status = "Matching draw lacks a single color target or sufficient observed state; using normal ReShade timing."; return; }
+	auto dev = cmd->get_device();
+	const auto target = dev->get_resource_from_view(command.targets.front());
+	effect_runtime *runtime = nullptr;
+	for (auto &entry : s.runtimes) if (entry.first->get_current_back_buffer() == target) { runtime = entry.first; break; }
+	if (!runtime)
+	{ s.early_status = "Waiting for the first matching draw to the current swap-chain back buffer. Off-screen UI targets are not supported."; return; }
+	if (s.runtimes.at(runtime).called) return;
+	if (command.last_queue != runtime->get_command_queue())
+	{ s.early_status = "Waiting for a matching command list with observed submission on ReShade's graphics queue."; return; }
+	for (const auto &table : command.tables) for (auto entry : table.tables)
+	{
+		if (!entry.handle) { s.early_status = "A bound descriptor table is empty. Using normal ReShade timing."; return; }
+		descriptor_heap heap = {}; dev->get_descriptor_heap_offset(entry, 0, 0, &heap, nullptr);
+		if (!heap.handle) { s.early_status = "A bound descriptor table cannot be restored. Using normal ReShade timing."; return; }
+	}
+	if (!runtime->get_effects_state()) { s.early_status = "ReShade effects are disabled."; return; }
+	const auto desc = dev->get_resource_desc(target);
+	if (desc.type != resource_type::texture_2d || desc.texture.samples != 1 || desc.texture.depth_or_layers != 1) return;
+	auto views = s.effect_views.find(target.handle);
+	if (views == s.effect_views.end())
+	{
+		effect_target_views created;
+		const auto format = dev->get_resource_view_desc(command.targets.front()).format;
+		const auto linear = format_to_default_typed(format, 0), srgb = format_to_default_typed(format, 1);
+		internal_scope guard;
+		if (!dev->create_resource_view(target, resource_usage::render_target, resource_view_desc(linear, 0, 1, 0, 1), &created.linear))
+		{ s.early_status = "Could not create the ReShade target view; using normal ReShade timing."; return; }
+		if (srgb == linear) created.srgb = created.linear;
+		else if (!dev->create_resource_view(target, resource_usage::render_target, resource_view_desc(srgb, 0, 1, 0, 1), &created.srgb))
+		{ dev->destroy_resource_view(created.linear); s.early_status = "Could not create the sRGB target view; using normal ReShade timing."; return; }
+		views = s.effect_views.emplace(target.handle, created).first;
+	}
+	const auto saved = copy_effect_state(command);
+	const auto render_views = views->second;
+	auto &frame = s.runtimes.at(runtime); frame.called = true;
+	command.early_runtime = runtime; command.early_runtime_frame = frame.frame;
+	++s.early_effect_calls;
+	s.early_status = "ReShade effect rendering requested before the matching UI draw. The normal presentation pass is skipped.";
+	// ReShade takes its input lock here. Release our state lock so its overlay
+	// thread can enter Mod Kit without a lock inversion while effects are drawn.
+	lock.unlock();
+	{
+		internal_scope guard;
+		runtime->render_effects(cmd, render_views.linear, render_views.srgb);
+		restore_effect_state(cmd, saved);
+	}
+	lock.lock();
+}
+
 template <typename Replay>
 static bool intercept(command_list *cmd, const char *kind, uint32_t count, uint32_t instances, uint32_t first, int32_t vertex_offset, bool compute, Replay replay, bool replayable = true)
 {
 	if (internal_call) return false;
-	std::lock_guard<std::recursive_mutex> lock(mutex);
+	std::unique_lock<std::recursive_mutex> lock(mutex);
 	auto s = find(cmd->get_device()); if (!s) return false;
 	auto &command = s->commands[cmd];
+	if (!compute) render_effects_at_point(cmd, *s, command, kind, count, lock);
 	++s->total_draws;
 	const bool deferred = explicit_api(cmd->get_device());
 	const bool capture = s->recording_frame || s->capture_next || s->live || s->gpu_timing || s->comparison.active;
@@ -1359,6 +1845,7 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 	s->recording_frame = s->live || s->capture_next; s->capture_next = false;
 	const auto now = std::chrono::steady_clock::now();
 	advance_comparison(*s, now);
+	collect_texture_snapshots(*s);
 	s->timing_pending.erase(std::remove_if(s->timing_pending.begin(), s->timing_pending.end(), [](auto &batch) { return collect_timing_readback(*batch); }), s->timing_pending.end());
 	// Live capture displays the newest completed measurements, not the newest
 	// submitted frame whose timestamps would still be pending every time.
@@ -1446,6 +1933,31 @@ static resource_info *resource_by_serial(device_state &s, uint64_t serial)
 static bool capture_gpu(effect_runtime *runtime, device_state &s, resource_info &info)
 {
 	auto dev = runtime->get_device();
+	if (dev->get_api() == device_api::d3d12)
+	{
+		info.preview_requested = true;
+		if (s.texture_request && s.texture_request->serial == info.serial) return false;
+		const auto retained = s.replacement_bytes - (s.texture_request ? s.texture_request->bytes : 0);
+		if (s.texture_snapshots.size() - (s.texture_request ? 1 : 0) >= 128 || retained >= max_replacement_bytes)
+		{ info.preview_note = "Preview allocation limit reached. Restart to reclaim retained snapshots."; return false; }
+		const auto snapshot = create_texture_snapshot(dev, info.handle, info.serial, runtime->get_command_queue());
+		if (!snapshot)
+		{ info.preview_note = "GPU previews support single-layer, single-sample 2D color textures up to 64 MiB. Depth and planar textures are not supported."; return false; }
+		if (retained + snapshot->bytes > max_replacement_bytes)
+		{ info.preview_note = "Snapshot would exceed the retained GPU memory limit."; return false; }
+		for (auto queue : s.queues) if (!install_timing_hook(queue))
+		{ info.preview_note = "Could not install GPU completion tracking for previews."; return false; }
+		for (const auto &command : s.commands) if (!install_texture_hook(command.first))
+		{ info.preview_note = "Could not install texture state tracking for previews."; return false; }
+		if (s.texture_request)
+			if (auto previous = resource_by_serial(s, s.texture_request->serial)) previous->preview_note = "Preview request replaced by a different texture selection. Click refresh to retry.";
+		cancel_texture_request(s);
+		s.texture_request = snapshot; s.texture_snapshots.push_back(snapshot); s.replacement_bytes += snapshot->bytes;
+		info.pending_preview = snapshot;
+		update_texture_enabled();
+		info.preview_note = "Waiting for the game's next complete texture transition on the graphics queue. Static textures may need a scene reload.";
+		return false; // The snapshot becomes available asynchronously.
+	}
 	if (explicit_api(dev)) { report(s, "GPU readback for explicit APIs needs per-subresource state and queue ownership tracking. CPU upload snapshots are available."); return false; }
 	if (info.desc.type != resource_type::buffer && (info.desc.type != resource_type::texture_2d || info.desc.texture.samples != 1)) return false;
 	resource_desc staging = info.desc;
@@ -1480,7 +1992,7 @@ static resource_view make_preview(device *dev, device_state &s, resource_info &i
 {
 	if (info.preview.handle) return info.preview;
 	if (s.owned_views.size() >= max_views) return {};
-	if (info.desc.type != resource_type::texture_2d || info.desc.texture.samples != 1) return {};
+	if (info.desc.type != resource_type::texture_2d || info.desc.texture.samples != 1 || info.desc.texture.depth_or_layers != 1 || !preview_format(info.desc.texture.format)) return {};
 	resource res = info.replacement;
 	internal_scope guard;
 	if (!res.handle)
@@ -1492,7 +2004,7 @@ static resource_view make_preview(device *dev, device_state &s, resource_info &i
 		if (!dev->create_resource(desc, &initial, resource_usage::shader_resource, &res)) return {};
 		s.owned_resources.push_back(res); s.replacement_bytes += info.captured.size();
 	}
-	resource_view_desc desc(format_to_default_typed(info.desc.texture.format));
+	resource_view_desc desc(format_to_default_typed(info.desc.texture.format), 0, 1, 0, 1);
 	if (!dev->create_resource_view(res, resource_usage::shader_resource, desc, &info.preview)) return {};
 	s.owned_views.push_back(info.preview); return info.preview;
 }
@@ -1535,13 +2047,21 @@ static void seed_resource(device_state &s, resource_info &info)
 	else report(s, "Export the native data and supply a complete mip chain, or supply an RGBA8/BGRA8 PNG");
 }
 static bool matches_filter(device_state &s, const std::string &value) { return !s.filter[0] || value.find(s.filter) != std::string::npos; }
-static void load_editor(device_state &s, const std::filesystem::path &path, const std::string &fallback)
+static bool load_editor(device_state &s, const std::filesystem::path &path, const std::string &fallback)
 {
-	s.editor_path = path; std::vector<uint8_t> bytes;
-	const std::string content = read_binary(path, bytes) ? std::string(bytes.begin(), bytes.end()) : fallback;
+	std::vector<uint8_t> bytes; std::error_code ec;
+	const bool exists = std::filesystem::exists(path, ec);
+	const auto size = exists ? std::filesystem::file_size(path, ec) : 0;
+	if (ec || (exists && size && !read_binary(path, bytes))) { report(s, "Could not read the source file. Previous editor contents retained."); return false; }
+	const std::string content = exists ? std::string(bytes.begin(), bytes.end()) : fallback;
+	if (content.size() >= s.editor.size()) { report(s, "Editor text limit is 64 KiB; open this file with an external editor. Previous contents retained."); return false; }
+	s.editor_path = path;
 	s.editor.fill(0);
-	std::memcpy(s.editor.data(), content.data(), std::min(content.size(), s.editor.size() - 1));
-	if (content.size() >= s.editor.size()) report(s, "Editor text limit is 64 KiB; use an external editor for larger files");
+	std::memcpy(s.editor.data(), content.data(), content.size());
+	s.editor_tab_requested = true;
+	s.editor_note = exists ? "Loaded the existing file. Save writes your changes to this path." : "Loaded a new template. The file is created when you click Save.";
+	report(s, exists ? "Opened source in Editor / rules." : "Opened a replacement template in Editor / rules. Save creates the file.");
+	return true;
 }
 static std::string hlsl_target(const shader_info &shader)
 {
@@ -1616,8 +2136,10 @@ static void show_shader(device_state &s, shader_info &shader)
 	if (ImGui::Button("Edit source"))
 	{
 		if (shader.extension == ".glsl") load_editor(s, path, std::string(shader.code.begin(), shader.code.end()));
-		else load_editor(s, s.root / "shaders" / (hex_id(shader.hash) + ".hlsl"), "// Replacement for " + hex_id(shader.hash) + "\n// Supply HLSL with the same entry point and input/output/resource interface.\n");
+		else if (load_editor(s, s.root / "shaders" / (hex_id(shader.hash) + ".hlsl"), "// Replacement for " + hex_id(shader.hash) + "\n// The original source is not available in this editor.\n// Supply HLSL with the same entry point and input/output/resource interface.\n"))
+			s.editor_note += " This is replacement HLSL, not recovered original source. DXIL/Shader Model 6 and SPIR-V need external compilation. Use Shader disassembly/source to inspect the compiled shader.";
 	}
+	if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open replacement source in Editor / rules. Compiled shaders without a replacement source file open a template.");
 	if (ImGui::CollapsingHeader("Shader disassembly/source"))
 	{
 		if (!s.disassemblies.count(shader.hash))
@@ -1673,13 +2195,20 @@ static void show_resource(effect_runtime *runtime, device_state &s, resource_inf
 	if (!info.error.empty()) ImGui::TextWrapped("%s", info.error.c_str());
 	if (info.desc.type == resource_type::texture_2d)
 	{
+		if (!info.preview_requested && info.captured.empty() && !info.replacement.handle && dev->get_api() == device_api::d3d12)
+			capture_gpu(runtime, s, info);
+		if (!info.preview_note.empty()) ImGui::TextWrapped("%s", info.preview_note.c_str());
+		if (dev->get_api() == device_api::d3d12 && s.texture_request && s.texture_request->serial == info.serial && ImGui::Button("Cancel preview request"))
+		{ cancel_texture_request(s); info.preview_note = "Preview request cancelled. Click refresh to retry."; }
 		if (const auto view = make_preview(dev, s, info); view.handle)
 		{
-			const float width = std::min(ImGui::GetContentRegionAvail().x, 512.0f);
+			const float aspect = float(info.desc.texture.width) / std::max(1u, info.desc.texture.height);
+			const float width = std::max(1.0f, std::min({ImGui::GetContentRegionAvail().x, 512.0f, 320.0f * aspect}));
 			ImGui::Image(ImTextureRef(view.handle), ImVec2(width, width * info.desc.texture.height / std::max(1u, info.desc.texture.width)));
-			ImGui::TextDisabled("Preview of a retained snapshot/replacement. Take a new snapshot to refresh.");
+			ImGui::TextDisabled("Base mip snapshot/replacement preview. Snapshot GPU contents to refresh.");
 		}
-		else ImGui::TextDisabled("No preview is available. Capture CPU uploads or snapshot GPU contents.");
+		else if (!preview_format(info.desc.texture.format)) ImGui::TextWrapped("This format cannot be displayed by the color preview. Native data can still be exported after a snapshot.");
+		else ImGui::TextWrapped("No preview yet. Capture CPU uploads or request a GPU snapshot.");
 	}
 	else if (!info.captured.empty())
 	{
@@ -1788,6 +2317,31 @@ static void show_profiler(effect_runtime *runtime, device_state &s)
 }
 static void show_draws(effect_runtime *runtime, device_state &s)
 {
+	ImGui::SeparatorText("ReShade execution point");
+	if (!s.early_effects.shaders.empty())
+	{
+		std::string shaders; for (auto hash : s.early_effects.shaders) { if (!shaders.empty()) shaders += ", "; shaders += shader_caption(s, hash); }
+		ImGui::TextWrapped("Before the first matching %s draw: %s", s.early_effects.kind.c_str(), shaders.c_str());
+		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12);
+		bool changed = ImGui::Checkbox("Enable early ReShade effects", &s.early_effects.enabled);
+		ImGui::SameLine(); changed |= ImGui::Checkbox("Match selected draw count", &s.early_effects.match_count);
+		ImGui::EndDisabled();
+		if (s.early_effects.match_count) ImGui::TextDisabled("Required count: %u", s.early_effects.count);
+		ImGui::BeginDisabled(s.comparison.active);
+		if (ImGui::Button("Clear execution point")) { s.early_effects = {}; changed = true; }
+		ImGui::EndDisabled();
+		if (changed)
+		{
+			++s.effect_point_generation;
+			s.early_status = s.early_effects.enabled ? "Waiting for newly recorded commands and the matching back-buffer draw." : "Early insertion disabled. ReShade resumes normal timing after affected commands are recorded again.";
+			enable_effect_state_tracking(s);
+			if (!save_effect_point(s.root / "effect-point.ini", s.early_effects)) report(s, "Could not save the ReShade execution point; changes remain in memory.");
+		}
+	}
+	ImGui::TextWrapped("%s", s.early_status.c_str());
+	if (s.early_effect_calls) ImGui::TextDisabled("Early effect requests this session: %llu", static_cast<unsigned long long>(s.early_effect_calls));
+	ImGui::TextWrapped("Select the first UI draw below to move effects before it. Initial support: D3D12 draws directly to the current back buffer, outside native render passes and queries. Unmatched frames use normal ReShade timing. Experimental; cached command lists and off-screen UI composition are not supported.");
+	ImGui::Separator();
 	if (ImGui::Button("Capture next frame")) { s.capture_next = true; s.live = false; }
 	ImGui::SameLine(); ImGui::Checkbox("Live capture", &s.live);
 	ImGui::SameLine(); if (ImGui::Button("Freeze")) { s.live = false; s.recording_frame = false; }
@@ -1827,6 +2381,17 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 		ImGui::Text("Count %u | Instances %u | First %u | Vertex offset %d", record.count, record.instances, record.first, record.vertex_offset);
 		ImGui::Text("Command list %s", hex_id(record.command).c_str());
 		ImGui::TextUnformatted("GPU ms:"); ImGui::SameLine(); show_gpu_time(record);
+		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12 || (record.kind != "draw" && record.kind != "indexed") || record.shaders.empty());
+		if (ImGui::Button("Execute ReShade pipeline before this call"))
+		{
+			s.early_effects = {true, false, record.kind, record.count, record.shaders};
+			std::sort(s.early_effects.shaders.begin(), s.early_effects.shaders.end());
+			++s.effect_point_generation;
+			s.early_status = "Execution point selected. Waiting for newly recorded commands and the matching back-buffer draw.";
+			enable_effect_state_tracking(s);
+			report(s, save_effect_point(s.root / "effect-point.ini", s.early_effects) ? "ReShade execution point saved for this game." : "Could not save the execution point; it is active for this session.");
+		}
+		ImGui::EndDisabled();
 		if (!record.marker.empty()) ImGui::TextWrapped("%s", record.marker.c_str());
 		if (ImGui::CollapsingHeader("Shaders", ImGuiTreeNodeFlags_DefaultOpen))
 			for (auto hash : record.shaders) if (auto shader = s.shaders.find(hash); shader != s.shaders.end())
@@ -1858,6 +2423,14 @@ static void draw_panel(effect_runtime *runtime)
 	ImGui::BeginDisabled(s.comparison.active); ImGui::Checkbox("Enable mods", &s.enabled); ImGui::EndDisabled();
 	ImGui::SameLine(); ImGui::Checkbox("Watch replacement files", &s.watch);
 	ImGui::SameLine(); if (ImGui::Button("Reload mods")) s.reload_requested = true;
+	if (ImGui::Button("Reset all suppression"))
+	{
+		if (s.comparison.active) finish_comparison(s, "Comparison cancelled by Reset all suppression.");
+		s.suppressed_shaders.clear();
+		report(s, "All shader suppression checkboxes cleared. Saved skip rules remain active. Cached commands need to be recorded again.");
+	}
+	ImGui::SetItemTooltip("Unticks all shader suppression controls and cancels comparisons. Saved rules.ini skip rules are separate mods.");
+	ImGui::SameLine(); ImGui::TextDisabled("%zu shaders suppressed", s.suppressed_shaders.size());
 	ImGui::InputTextWithHint("##modkit_filter", "Filter actions, markers or resource/shader IDs", s.filter, sizeof(s.filter));
 	if (ImGui::BeginTabBar("modkit_tabs"))
 	{
@@ -1890,14 +2463,16 @@ static void draw_panel(effect_runtime *runtime)
 			if (auto info = resource_by_serial(s, s.selected_resource)) show_resource(runtime, s, *info);
 			ImGui::EndChild(); ImGui::EndTabItem();
 		}
-		if (ImGui::BeginTabItem("Editor / rules"))
+		if (ImGui::BeginTabItem("Editor / rules", nullptr, s.editor_tab_requested ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None))
 		{
+			s.editor_tab_requested = false;
 			if (ImGui::Button("Edit draw rules")) load_editor(s, s.root / "rules.ini", "; Draw rules\n");
 			ImGui::SameLine(); if (ImGui::Button("Save"))
 			{
 				if (!s.editor_path.empty() && write_binary(s.editor_path, s.editor.data(), std::strlen(s.editor.data()))) { s.reload_requested = true; report(s, "Saved " + s.editor_path.u8string()); }
 			}
 			ImGui::TextWrapped("%s", s.editor_path.u8string().c_str());
+			if (!s.editor_note.empty()) ImGui::TextWrapped("%s", s.editor_note.c_str());
 			ImGui::InputTextMultiline("##editor", s.editor.data(), s.editor.size(), ImVec2(-1, 350), ImGuiInputTextFlags_AllowTabInput);
 			if (s.editor_path.extension() == ".hlsl")
 			{
@@ -1929,6 +2504,7 @@ static void draw_panel(effect_runtime *runtime)
 
 #define MODKIT_EVENTS(X) \
 	X(init_device, on_init_device) X(destroy_device, on_destroy_device) \
+	X(init_effect_runtime, on_init_runtime) X(destroy_effect_runtime, on_destroy_runtime) X(reshade_present, on_runtime_present) \
 	X(init_command_queue, on_init_queue) X(destroy_command_queue, on_destroy_queue) \
 	X(init_command_list, on_init_command) X(destroy_command_list, on_destroy_command) X(reset_command_list, on_reset_command) X(execute_secondary_command_list, on_secondary) X(execute_command_list, on_execute) \
 	X(init_pipeline, on_init_pipeline) X(destroy_pipeline, on_destroy_pipeline) X(bind_pipeline, on_bind_pipeline) \
@@ -1937,7 +2513,8 @@ static void draw_panel(effect_runtime *runtime)
 	X(update_texture_region, on_update_texture) X(update_buffer_region, on_update_buffer) X(update_texture_region_command, on_update_texture_cmd) X(update_buffer_region_command, on_update_buffer_cmd) \
 	X(map_buffer_region, on_map_buffer) X(unmap_buffer_region, on_unmap_buffer) X(map_texture_region, on_map_texture) X(unmap_texture_region, on_unmap_texture) X(copy_buffer_to_texture, on_buffer_to_texture) \
 	X(update_descriptor_tables, on_update_descriptors) X(copy_descriptor_tables, on_copy_descriptors) X(push_descriptors, on_push) X(bind_descriptor_tables, on_bind_tables) \
-	X(bind_vertex_buffers, on_vertices) X(bind_index_buffer, on_index) X(bind_render_targets_and_depth_stencil, on_targets) X(begin_render_pass, on_render_pass) \
+	X(bind_vertex_buffers, on_vertices) X(bind_index_buffer, on_index) X(bind_render_targets_and_depth_stencil, on_targets) X(begin_render_pass, on_render_pass) X(end_render_pass, on_end_render_pass) \
+	X(push_constants, on_constants) X(begin_query, on_begin_query) X(end_query, on_end_query) \
 	X(bind_viewports, on_viewports) X(bind_scissor_rects, on_scissors) X(bind_pipeline_states, on_dynamic_states) \
 	X(draw, on_draw) X(draw_indexed, on_draw_indexed) X(dispatch, on_dispatch) X(dispatch_mesh, on_mesh) X(draw_or_dispatch_indirect, on_indirect) X(present, on_present)
 

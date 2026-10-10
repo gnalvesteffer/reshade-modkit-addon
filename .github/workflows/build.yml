@@ -1,16 +1,49 @@
-name: Build add-on
+name: Build, check and release
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: modkit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
+  checks:
+    name: Portable profile and package checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Check patch whitespace and Python syntax
+        run: |
+          git show --format= --check HEAD
+          python -m py_compile scripts/fetch-dxc.py scripts/package.py tests/test_package.py
+          python -m json.tool vendor/versions.json > /dev/null
+      - name: Check portable profile parsing
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Isource tests/profile_checks.cpp -o /tmp/modkit-profile-checks
+          /tmp/modkit-profile-checks
+      - name: Check release packaging
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
   windows:
+    name: Windows x64 build and persistence checks
     runs-on: windows-latest
+    env:
+      PACKAGE_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -19,15 +52,20 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
-      - name: Build x64 add-on
+      - name: Build x64 add-on and checks
         run: |
-          cmake -S . -B build -A x64
+          cmake -S . -B build -A x64 -DMODKIT_BUILD_CHECKS=ON
           cmake --build build --config Release --parallel
-      - name: Package DXIL disassembler
-        run: python scripts/fetch-dxc.py --destination build/Release
+      - name: Check profiles, labels and execution point persistence
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package DXIL disassembler and installable ZIP
+        run: |
+          python scripts/fetch-dxc.py --destination build/Release
+          python scripts/package.py --binary-dir build/Release --output-dir dist --version "$env:PACKAGE_VERSION"
       - uses: actions/upload-artifact@v7
         with:
           name: ModKit-addon-x64
+          if-no-files-found: error
           path: |
             build/Release/ModKit.addon64
             build/Release/ModKit-tools/
@@ -41,3 +79,30 @@ jobs:
             vendor/minhook/LICENSE.txt
             vendor/dxc/LICENSE-MS.txt
             vendor/dxc/LICENSE-LLVM.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ModKit-install-package
+          if-no-files-found: error
+          path: dist/*
+
+  release:
+    name: Publish tagged release
+    needs: [checks, windows]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ModKit-install-package
+          path: dist
+      - name: Publish downloadable ZIP and SHA256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Mod Kit $RELEASE_TAG" --generate-notes "${options[@]}"

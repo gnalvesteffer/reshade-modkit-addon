@@ -1,5 +1,8 @@
 /build*/
 /bin/
+/dist/
+__pycache__/
+*.pyc
 /.vs/
 *.addon32
 *.addon64

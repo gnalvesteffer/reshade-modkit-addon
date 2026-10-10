@@ -31,7 +31,7 @@ Build headers and sources are vendored with their licenses and pinned revisions 
 1. Select **Capture next frame**, or enable **Live capture**. **Freeze** keeps the displayed frame while gameplay continues.
 2. Select an action in **Frame / pipeline**. The detail pane shows bound shader IDs, textures, buffers, render targets, viewports, scissors and dynamic state. Search by shader label, shader/resource ID or action.
 3. Export a shader, texture or buffer; or create a replacement from a captured resource. Each game's files live under `reshade-modkit/<executable-name>/` beside the ReShade configuration.
-4. Edit replacement files externally, or use **Edit source** and **Editor / rules**. GLSL source can be edited directly. DXBC Shader Model 4/5 HLSL replacements can be compiled in the panel. DXIL/Shader Model 6 requires an external compiler such as DXC; SPIR-V requires an external SPIR-V compiler. Keep the original stage, entry point and resource/input/output interface compatible.
+4. Edit replacement files externally, or use **Edit source**, which switches to **Editor / rules** and loads an existing replacement file or a new template. **Save** creates or updates the file. GLSL source can be edited directly. Original HLSL is not reconstructed from a compiled shader; inspect its disassembly separately. DXBC Shader Model 4/5 HLSL replacements can be compiled in the panel. DXIL/Shader Model 6 requires an external compiler such as DXC; SPIR-V requires an external SPIR-V compiler. Keep the original stage, entry point and resource/input/output interface compatible. The embedded editor accepts files smaller than 64 KiB and refuses larger files without replacing the current editor text.
 5. Leave **Watch replacement files** enabled to reload changes about every 500 ms, or select **Reload mods**. Compilation and GPU allocation happen when a replacement is first needed, and can briefly stall rendering.
 6. Toggle **Suppress draws using this shader** to identify the geometry or effect a shader draws. Toggle the resource's replacement checkbox, or **Enable mods**, to compare the original and modified graphics.
 
@@ -49,6 +49,16 @@ Labels are stored per game in `shader-labels.tsv`, using original shader bytecod
 
 Games can also emit PIX render-pass markers and debug object names. Those describe engine events or objects and may be absent in retail builds. Receiving them requires native API interception; the public ReShade SDK does not expose marker callbacks. Native marker capture is not implemented in this release.
 
+## Run ReShade effects before the UI
+
+Initial support is **experimental D3D12**. Capture a frame, identify the first draw of the game's UI in **Frame / pipeline**, and click **Execute ReShade pipeline before this call**. The add-on saves an execution point in `effect-point.ini` and enables it for this game. It matches the draw kind and the complete set of original bound shader IDs, then uses the first matching draw to the current swap-chain back buffer each frame. **Match selected draw count** adds the selected vertex/index count as a filter; it is off initially because UI batches can change size between frames. Selecting a later draw that shares the same shaders can therefore trigger at an earlier matching draw.
+
+At the match, the add-on calls the public `effect_runtime::render_effects()` API before the game's draw, restores observed graphics and compute bindings, and allows the game to draw its UI over the processed scene. ReShade skips its normal presentation-time effects pass. Frames without a supported match keep normal ReShade timing, so effects can still cover the UI on those frames. **Enable early ReShade effects** disables the execution point; **Clear execution point** removes the saved match. Saved enabled state is a user preference; games with no saved point use normal ReShade timing.
+
+Supported matches use one single-sampled color target that is the current back buffer, on a direct command list outside native render passes and active queries. The command list must have been recorded since the execution point was enabled or changed, with an observed root signature, PSO, shader-visible descriptor heap, viewports, scissors and primitive topology. State hooks are installed only when early effects are enabled: they preserve native descriptor heap bindings, including bindless rendering, and the full floating-point blend factor. SDK callbacks track root constants only while enabled. A forwarding hook remains after first use, while metadata copying stops when the feature is disabled.
+
+This does not automatically find the UI or exclude UI already drawn. It does not support off-screen UI textures, UI compositing after the selected draw, Vulkan render-pass injection, indirect draws, bundles or arbitrary queue/parallel recording order. Use a draw on the runtime's regular graphics queue, recorded in frame order. Reused command lists containing an injected pass are detected at submission: further insertion is disabled and normal presentation processing is suppressed for those lists to avoid applying effects twice. Already recorded commands cannot be removed; they retain old effect bindings and uniforms. Re-record them or restart the game before reloading effects or changing the preset. Runtime compatibility and visual results still need a game run.
+
 ## Replacement files
 
 ```text
@@ -61,6 +71,7 @@ reshade-modkit/GameExecutable/
   buffers/<resource-id>.bin
   rules.ini
   shader-labels.tsv                   # Saved user labels keyed by shader hash
+  effect-point.ini                    # Saved early ReShade draw match
   captures/                          # Original exports and frame TSV files
 ```
 
@@ -93,6 +104,18 @@ Kinds: `any`, `draw`, `indexed`, `dispatch`, `mesh`, `indirect`. Filters: `shade
 
 Panel suppression switches are session controls; use `rules.ini` to persist a mod.
 
+**Reset all suppression** unticks all shader suppression controls, including those outside the current filter, and cancels any suppression comparison before clearing the controls. It preserves replacements and saved rules. A skip rule in `rules.ini` can still suppress a draw. On D3D12/Vulkan, commands whose draws were already omitted must be recorded again by the game before those draws return.
+
+## Texture previews
+
+Selecting a 2D texture displays a base mip image from a retained CPU snapshot or replacement. Normalized, floating-point and BC compressed color formats use the GPU sampler to display their contents. Integer, depth/stencil, multisampled, planar, array and 3D visualization needs further conversion/view selection support. HDR values are shown through the normal overlay shader, without exposure controls or tone mapping.
+
+For D3D12 GPU-only textures, selection requests an asynchronous snapshot. **Snapshot GPU contents** refreshes it; **Cancel preview request** stops a waiting request. Only the requested texture is copied. The add-on waits for a complete legacy transition of mip 0 on a direct command list previously observed on the runtime's graphics queue, outside render passes and queries. It uses the native barrier's exact final state, copies mip 0 into a readback buffer, then restores that state. Split transitions and ambiguous aliasing batches are skipped. A submission fence must complete before the buffer is mapped; regular preview collection does not flush or wait for GPU idle. Snapshot contents can also be exported or used to seed a replacement.
+
+This captures the next qualifying transition, rather than the exact captured draw's contents. A static texture with no later transition can remain pending; a scene reload may update or replace it, requiring reselection. Enhanced barriers, copy/compute queue capture and Vulkan GPU-only readback are not covered yet. CPU upload snapshots and replacements remain available on those paths. Request failures and waiting status are shown beside the preview.
+
+Native preview hooks are installed on demand. The original command list retains its injected copy until the game records it again, so replaying a cached list can still incur a copy after the preview is frozen. Each snapshot uses a fence; cross-queue reuse adds a GPU dependency. Readback buffers referenced by recorded lists stay alive until device teardown, bounded by 128 snapshots, 64 MiB per snapshot and the shared 512 MiB retained allocation limit. Unrecorded cancelled requests release their allocation. Preview sampling and readback still need validation in a game.
+
 ## API coverage and current boundaries
 
 | Feature | Coverage |
@@ -101,6 +124,7 @@ Panel suppression switches are session controls; use `rules.ini` to persist a mo
 | Shader inspection/export | Shader code supplied through observed pipeline creation |
 | Saved shader labels | Per-game bytecode hash labels, shown in search, profiling and exports |
 | Shader disassembly | DXBC via D3DCompiler; DXIL via bundled DXC; GLSL source |
+| ReShade execution point | Experimental D3D12 before a matching draw to the current back buffer |
 | Shader replacement | Rebuildable raster/compute pipelines; old pipeline retained if creation fails |
 | Texture/buffer substitution | Direct pushed descriptors, vertex/index buffers and supported descriptor tables |
 | D3D12/Vulkan table substitution | Fully observed tables with at most 255 descriptors; unbounded, partially bound and static-sampler ranges are passed through |
@@ -109,7 +133,7 @@ Panel suppression switches are session controls; use `rules.ini` to persist a mo
 | GPU timing | Opt-in D3D12 direct draw/indexed/dispatch/mesh actions; asynchronous per-submission timestamp readbacks |
 | Suppression comparison | Four alternating enabled/suppressed phases using CPU-observed present intervals |
 | Shader editing | GLSL; HLSL compilation for DXBC Shader Model 4/5; external compilation for DXIL/SPIR-V |
-| Readback | Implicit APIs; CPU upload snapshots for explicit APIs |
+| Readback | Implicit APIs; on-demand D3D12 color mip snapshots at observed legacy transitions; CPU uploads on other explicit paths |
 
 This is an inspector of intercepted command metadata and a graphics modding tool. It does not replay a frame offline, debug individual shader invocations, expose GPU performance counters, recover missing source code, or guarantee compatibility with injected overlays or games that restrict injection. Ray tracing pipeline replacement is disabled because it also requires rewriting shader binding tables. Native PIX and other marker payloads are not decoded by this add-on.
 
@@ -137,7 +161,7 @@ Results are CPU-observed present intervals with means, standard deviations, and 
 
 ## Build coverage
 
-A local MinGW cross build and Windows CI build compile the add-on. This does not establish game compatibility or profiling accuracy under Proton; those need a real game run. No runtime checks or benchmark claims are implied by successful compilation.
+A local MinGW cross build and Windows CI build compile the add-on. CI runs portable profile parsing, package/checksum checks and Windows checks for saved labels, execution points and texture snapshot guards. Version tags publish downloadable release ZIPs after these checks pass. This does not establish game compatibility, texture visualization or profiling accuracy under Proton; those need a real game run.
 
 ## References
 
