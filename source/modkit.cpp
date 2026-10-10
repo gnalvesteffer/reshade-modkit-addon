@@ -144,6 +144,8 @@ struct draw_record
 	uint64_t command = 0;
 	std::vector<uint64_t> shaders;
 	std::vector<draw_resource> resources;
+	std::vector<std::string> output_targets;
+	bool back_buffer_target = false;
 	bool modified = false, skipped = false;
 	std::string marker;
 	std::vector<viewport> viewports;
@@ -159,6 +161,7 @@ static size_t action_size(const draw_record &action)
 {
 	size_t bytes = sizeof(action) + action.kind.size() + action.marker.size() + action.shaders.size() * sizeof(uint64_t) + action.viewports.size() * sizeof(viewport) + action.scissors.size() * sizeof(rect) + action.dynamic_states.size() * 32;
 	for (const auto &res : action.resources) bytes += sizeof(res) + res.id.size() + res.role.size();
+	for (const auto &target : action.output_targets) bytes += target.size();
 	return bytes;
 }
 struct file_info { std::filesystem::file_time_type time; uintmax_t size; uint64_t generation; };
@@ -188,7 +191,7 @@ struct device_state
 	shader_label_map shader_labels;
 	bool labels_dirty = false;
 	effect_point early_effects;
-	uint64_t effect_point_generation = 1, early_effect_calls = 0;
+	uint64_t effect_point_generation = 1, early_effect_calls = 0, early_effect_misses = 0;
 	std::string early_status = "No execution point selected. ReShade renders effects before presentation.";
 	std::unordered_map<effect_runtime *, early_runtime_state> runtimes;
 	std::unordered_map<uint64_t, effect_target_views> effect_views;
@@ -1482,6 +1485,17 @@ static draw_record make_draw_record(device *dev, device_state &s, command_state 
 	if (!s.recording_frame && !s.capture_next && !s.live) return record;
 	for (auto &label : command.markers) { if (!record.marker.empty()) record.marker += " / "; record.marker += label; }
 	record.viewports = command.viewports; record.scissors = command.scissors; record.dynamic_states = command.dynamic_states;
+	for (uint32_t i = 0; i < command.target_count; ++i)
+	{
+		const auto target = dev->get_resource_from_view(command.targets[i]);
+		bool back_buffer = false;
+		for (const auto &runtime : s.runtimes) back_buffer |= runtime.first->get_current_back_buffer() == target;
+		record.back_buffer_target |= back_buffer;
+		if (auto info = s.resources.find(target.handle); info != s.resources.end())
+			record.output_targets.push_back(std::string(back_buffer ? "Back buffer: " : "Off-screen: ") + info->second.id);
+		else
+			record.output_targets.push_back(std::string(back_buffer ? "Back buffer" : "Off-screen") + " (" + hex_id(target.handle) + ")");
+	}
 	if (!s.detailed_resources) return record;
 	for (auto &binding : command.vertices) add_resource(s, record, binding.second.buffer, "Vertex " + std::to_string(binding.first));
 	add_resource(s, record, command.index, "Index");
@@ -1678,9 +1692,9 @@ static void render_effects_at_point(command_list *cmd, device_state &s, command_
 	if (command.effect_point_generation != s.effect_point_generation)
 	{ s.early_status = "Waiting for the game to record this command list again."; return; }
 	if (command.in_render_pass || command.active_queries || reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native())->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
-	{ s.early_status = "Matching draw is inside a render pass/query or a non-direct command list; using normal ReShade timing."; return; }
+	{ s.early_status = "Matching draw is inside a render pass/query or a non-direct command list; ReShade effects will be skipped this frame."; return; }
 	if (command.target_count != 1 || !command.root_layouts[0].handle || command.pipelines.empty() || command.native_heaps.empty() || command.viewports.empty() || command.scissors.empty() || !command.dynamic_states.count(dynamic_state::primitive_topology))
-	{ s.early_status = "Matching draw lacks a single color target or sufficient observed state; using normal ReShade timing."; return; }
+	{ s.early_status = "Matching draw lacks a single color target or sufficient observed state; ReShade effects will be skipped this frame."; return; }
 	auto dev = cmd->get_device();
 	const auto target = dev->get_resource_from_view(command.targets.front());
 	effect_runtime *runtime = nullptr;
@@ -1707,10 +1721,10 @@ static void render_effects_at_point(command_list *cmd, device_state &s, command_
 		const auto linear = format_to_default_typed(format, 0), srgb = format_to_default_typed(format, 1);
 		internal_scope guard;
 		if (!dev->create_resource_view(target, resource_usage::render_target, resource_view_desc(linear, 0, 1, 0, 1), &created.linear))
-		{ s.early_status = "Could not create the ReShade target view; using normal ReShade timing."; return; }
+		{ s.early_status = "Could not create the ReShade target view; ReShade effects will be skipped this frame."; return; }
 		if (srgb == linear) created.srgb = created.linear;
 		else if (!dev->create_resource_view(target, resource_usage::render_target, resource_view_desc(srgb, 0, 1, 0, 1), &created.srgb))
-		{ dev->destroy_resource_view(created.linear); s.early_status = "Could not create the sRGB target view; using normal ReShade timing."; return; }
+		{ dev->destroy_resource_view(created.linear); s.early_status = "Could not create the sRGB target view; ReShade effects will be skipped this frame."; return; }
 		views = s.effect_views.emplace(target.handle, created).first;
 	}
 	const auto saved = copy_effect_state(command);
@@ -1829,8 +1843,20 @@ static bool on_indirect(command_list *cmd, indirect_command type, resource buffe
 { return intercept(cmd, "indirect", count, stride, 0, 0, type == indirect_command::dispatch, [&](uint32_t, uint32_t) { cmd->draw_or_dispatch_indirect(type, buffer, offset, count, stride); }, type != indirect_command::unknown); }
 static void on_present(command_queue *queue, swapchain *, const rect *, const rect *, uint32_t, const rect *)
 {
-	std::lock_guard<std::recursive_mutex> lock(mutex);
+	std::unique_lock<std::recursive_mutex> lock(mutex);
 	auto s = find(queue->get_device()); if (!s) return;
+	if (s->early_effects.enabled && queue->get_device()->get_api() == device_api::d3d12)
+		for (auto &entry : s->runtimes) if (entry.first->get_command_queue() == queue && !entry.second.called)
+		{
+			auto *runtime = entry.first;
+			entry.second.called = true;
+			++s->early_effect_misses;
+			s->early_status = "No matching supported back-buffer draw this frame. ReShade effects were skipped to keep them off the UI; select a draw marked Back buffer.";
+			lock.unlock();
+			{ internal_scope guard; runtime->render_effects(queue->get_immediate_command_list(), {}, {}); }
+			lock.lock();
+			break;
+		}
 	if (s->recording_frame)
 	{
 		++s->frame_index;
@@ -2225,13 +2251,14 @@ static void show_resource(effect_runtime *runtime, device_state &s, resource_inf
 static void export_frame(device_state &s)
 {
 	const auto path = s.root / "captures" / ("frame-" + std::to_string(s.displayed_frame_index) + ".tsv");
-	std::ofstream file(path); file << "event\tkind\tcount\tinstances\tfirst\tvertex_offset\tcommand\tskipped\tmodified\tshaders\tresources\tmarker\tgpu_ms\ttiming_status\tshader_labels\n";
+	std::ofstream file(path); file << "event\tkind\tcount\tinstances\tfirst\tvertex_offset\tcommand\tskipped\tmodified\tshaders\tresources\toutput_targets\tmarker\tgpu_ms\ttiming_status\tshader_labels\n";
 	for (size_t i = 0; i < s.frame.size(); ++i)
 	{
 		const auto &r = s.frame[i];
 		file << i + 1 << '\t' << r.kind << '\t' << r.count << '\t' << r.instances << '\t' << r.first << '\t' << r.vertex_offset << '\t' << hex_id(r.command) << '\t' << r.skipped << '\t' << r.modified << '\t';
 		for (auto shader : r.shaders) file << hex_id(shader) << ' ';
 		file << '\t'; for (auto &res : r.resources) file << res.id << ' ';
+		file << '\t'; for (const auto &target : r.output_targets) { std::string clean = target; std::replace(clean.begin(), clean.end(), '\t', ' '); std::replace(clean.begin(), clean.end(), '\n', ' '); file << clean << " | "; }
 		std::string marker = r.marker; std::replace(marker.begin(), marker.end(), '\t', ' '); std::replace(marker.begin(), marker.end(), '\n', ' ');
 		file << '\t' << marker << '\t';
 		if (r.gpu && r.gpu->ready && r.gpu->milliseconds >= 0) file << r.gpu->milliseconds;
@@ -2339,8 +2366,8 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 		}
 	}
 	ImGui::TextWrapped("%s", s.early_status.c_str());
-	if (s.early_effect_calls) ImGui::TextDisabled("Early effect requests this session: %llu", static_cast<unsigned long long>(s.early_effect_calls));
-	ImGui::TextWrapped("Select the first UI draw below to move effects before it. Initial support: D3D12 draws directly to the current back buffer, outside native render passes and queries. Unmatched frames use normal ReShade timing. Experimental; cached command lists and off-screen UI composition are not supported.");
+	if (s.early_effect_calls || s.early_effect_misses) ImGui::TextDisabled("Early effect requests: %llu | Frames without a matching back-buffer draw: %llu", static_cast<unsigned long long>(s.early_effect_calls), static_cast<unsigned long long>(s.early_effect_misses));
+	ImGui::TextWrapped("Select a draw marked Back buffer at the point effects should run (after the scene and before the UI). Off-screen UI draws cannot trigger the pass. If no supported match occurs, ReShade effects are skipped for that frame so they do not cover the UI. Experimental D3D12 support; cached command lists and native render passes are not supported.");
 	ImGui::Separator();
 	if (ImGui::Button("Capture next frame")) { s.capture_next = true; s.live = false; }
 	ImGui::SameLine(); ImGui::Checkbox("Live capture", &s.live);
@@ -2352,9 +2379,9 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 	if (!s.timed_frames.empty()) ImGui::TextDisabled("Waiting for GPU measurements: %zu newer frames", s.timed_frames.size());
 	const float list_width = std::max(240.0f, ImGui::GetContentRegionAvail().x * 0.44f);
 	ImGui::BeginChild("events", ImVec2(list_width, 450), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
-	if (ImGui::BeginTable("draw_list", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY))
+	if (ImGui::BeginTable("draw_list", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY))
 	{
-		ImGui::TableSetupColumn("Event"); ImGui::TableSetupColumn("Action"); ImGui::TableSetupColumn("Count / X"); ImGui::TableSetupColumn("Instances / Y"); ImGui::TableSetupColumn("GPU ms"); ImGui::TableSetupColumn("Region"); ImGui::TableHeadersRow();
+		ImGui::TableSetupColumn("Event"); ImGui::TableSetupColumn("Action"); ImGui::TableSetupColumn("Count / X"); ImGui::TableSetupColumn("Instances / Y"); ImGui::TableSetupColumn("GPU ms"); ImGui::TableSetupColumn("Output"); ImGui::TableSetupColumn("Region"); ImGui::TableHeadersRow();
 		std::vector<size_t> order; for (size_t i = 0; i < s.frame.size(); ++i) order.push_back(i);
 		if (s.expensive_first) std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return gpu_ms(s.frame[a]) > gpu_ms(s.frame[b]); });
 		for (size_t i : order)
@@ -2368,6 +2395,7 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 			if (ImGui::Selectable(label.c_str(), s.selected_draw == static_cast<int>(i), ImGuiSelectableFlags_SpanAllColumns)) s.selected_draw = static_cast<int>(i);
 			ImGui::TableNextColumn(); ImGui::TextUnformatted(record.kind.c_str()); ImGui::TableNextColumn(); ImGui::Text("%u", record.count);
 			ImGui::TableNextColumn(); ImGui::Text("%u", record.instances); ImGui::TableNextColumn(); show_gpu_time(record);
+			ImGui::TableNextColumn(); ImGui::TextUnformatted(record.back_buffer_target ? "Back buffer" : record.output_targets.empty() ? "--" : "Off-screen");
 			ImGui::TableNextColumn(); ImGui::TextUnformatted(record.marker.c_str()); ImGui::PopID();
 		}
 		ImGui::EndTable();
@@ -2380,9 +2408,11 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 		ImGui::Text("Event %d: %s", s.selected_draw + 1, record.kind.c_str());
 		ImGui::Text("Count %u | Instances %u | First %u | Vertex offset %d", record.count, record.instances, record.first, record.vertex_offset);
 		ImGui::Text("Command list %s", hex_id(record.command).c_str());
+		if (record.output_targets.empty()) ImGui::TextDisabled("Output target was not captured. Capture a new frame to identify it.");
+		else for (const auto &target : record.output_targets) ImGui::TextWrapped("Output: %s", target.c_str());
 		ImGui::TextUnformatted("GPU ms:"); ImGui::SameLine(); show_gpu_time(record);
-		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12 || (record.kind != "draw" && record.kind != "indexed") || record.shaders.empty());
-		if (ImGui::Button("Execute ReShade pipeline before this call"))
+		ImGui::BeginDisabled(s.comparison.active || runtime->get_device()->get_api() != device_api::d3d12 || (record.kind != "draw" && record.kind != "indexed") || record.shaders.empty() || !record.back_buffer_target);
+		if (ImGui::Button("Execute ReShade effects before this back-buffer draw"))
 		{
 			s.early_effects = {true, false, record.kind, record.count, record.shaders};
 			std::sort(s.early_effects.shaders.begin(), s.early_effects.shaders.end());
@@ -2392,6 +2422,7 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 			report(s, save_effect_point(s.root / "effect-point.ini", s.early_effects) ? "ReShade execution point saved for this game." : "Could not save the execution point; it is active for this session.");
 		}
 		ImGui::EndDisabled();
+		if (!record.back_buffer_target) ImGui::TextWrapped("This draw does not write to the current swap-chain back buffer. Select a draw marked Back buffer at the point effects should run, after the scene and before the UI.");
 		if (!record.marker.empty()) ImGui::TextWrapped("%s", record.marker.c_str());
 		if (ImGui::CollapsingHeader("Shaders", ImGuiTreeNodeFlags_DefaultOpen))
 			for (auto hash : record.shaders) if (auto shader = s.shaders.find(hash); shader != s.shaders.end())
