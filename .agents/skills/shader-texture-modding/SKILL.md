@@ -18,7 +18,9 @@ Use this skill for user-facing mod workflows, replacement format changes, editor
 
 - Follow the per-game directory layout and exact extensions documented in `MODKIT.md`.
 - Preserve the original shader stage, entry point and input/output/resource interface. Original HLSL source is not reconstructed from compiled bytecode.
-- The built-in editor supports GLSL editing and DXBC Shader Model 4/5 HLSL compilation. DXIL and SPIR-V compilation need external tools. Use disassembly as inspection data, not as recoverable original source.
+- The built-in editor supports GLSL editing, DXBC Shader Model 4/5 HLSL compilation, and DXIL Shader Model 6 compilation with bundled DXC/validator tools. SPIR-V compilation needs external tools. Use the original interface and disassembly as inspection data, not as recoverable original source. Generated pixel starters output a diagnostic color and do not preserve original lighting.
+- Use **Open replacement editor** or **Import source...** for shaders, then **Compile and apply** for HLSL. For compatible RGBA8/BGRA8 texture snapshots, **Edit PNG externally** opens an editable replacement; **Import PNG...** installs matching images. Native texture replacements must contain the complete mip chain.
+- When importing game-provided HLSL, configure include directories and the original variant's defines in the editor's compiler settings. The original source directory is added automatically; root-relative includes may need the game/source root as well. These settings persist in the shader's `.compile.ini`.
 - Texture PNG replacement is limited to matching dimensions and RGBA8/BGRA8 formats. Native `.bin` replacements must match the supported format layout and include every mip level. Buffer replacements must match the original byte size.
 - Replacement and suppression affect supported intercepted work; they do not rewrite every game resource use or every API path. Consult the coverage table in `MODKIT.md` before promising compatibility.
 

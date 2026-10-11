@@ -31,9 +31,15 @@ Build headers and sources are vendored with their licenses and pinned revisions 
 1. Select **Capture next frame**, or enable **Live capture**. **Freeze** keeps the displayed frame while gameplay continues.
 2. Select an action in **Frame / pipeline**. The detail pane shows bound shader IDs, textures, buffers, render targets, viewports, scissors and dynamic state. Search by shader label, shader/resource ID or action.
 3. Export a shader, texture or buffer; or create a replacement from a captured resource. Each game's files live under `reshade-modkit/<executable-name>/` beside the ReShade configuration.
-4. Edit replacement files externally, or use **Edit source**, which switches to **Editor / rules** and loads an existing replacement file or a new template. **Save** creates or updates the file. GLSL source can be edited directly. Original HLSL is not reconstructed from a compiled shader; inspect its disassembly separately. DXBC Shader Model 4/5 HLSL replacements can be compiled in the panel. DXIL/Shader Model 6 requires an external compiler such as DXC; SPIR-V requires an external SPIR-V compiler. Keep the original stage, entry point and resource/input/output interface compatible. The embedded editor accepts files smaller than 64 KiB and refuses larger files without replacing the current editor text.
+4. For a shader, choose **Open replacement editor** (Direct3D) or **Edit GLSL source**. This switches to **Editor / rules** and opens an existing replacement or new source. Original HLSL is not reconstructed from compiled bytecode. The Direct3D editor displays original reflected inputs, outputs, resource registers and disassembly; supported pixel shaders get a generated magenta-output starter with the original output semantics. This starter identifies a shader's contribution and deliberately replaces its shading. Edit the color or write compatible HLSL, then **Compile and apply**. Shader Model 4/5 compiles with D3DCompiler and Shader Model 6 with bundled DXC and its validator. **Import source...** opens user-supplied HLSL/GLSL; **Import compiled replacement...** installs externally compiled Direct3D/SPIR-V bytecode. SPIR-V still needs an external authoring/compiler tool. Keep the original stage, entry point and resource/input/output interface compatible. The embedded editor accepts text smaller than 64 KiB.
 5. Leave **Watch replacement files** enabled to reload changes about every 500 ms, or select **Reload mods**. Compilation and GPU allocation happen when a replacement is first needed, and can briefly stall rendering.
 6. Toggle **Suppress draws using this shader** to identify the geometry or effect a shader draws. Toggle the resource's replacement checkbox, or **Enable mods**, to compare the original and modified graphics.
+
+**Save source** retains HLSL on disk without compiling it. **Compile and apply** saves source and publishes compiled bytecode only after compilation succeeds. Compiler warnings/errors remain visible beside the editor; a failed compilation preserves the previous compiled replacement. **Generate pixel shader starter** can replace an older comment-only template with working diagnostic HLSL where reflection is supported. Other stages need user-authored compatible source. **Open externally** saves and opens the file with the desktop's associated application; **Reload file** refreshes the editor. Compilation reloads external changes when there are no unsaved in-game edits, and refuses to overwrite a source file changed both externally and in the editor. Paths can be copied if desktop application launch is unavailable under a compatibility layer.
+
+**Compiler settings: includes and defines** accepts one include directory per line and one `NAME` or `NAME=VALUE` definition per line. Source imports add the original file's directory so its local headers can be found. Add any game/source root used by root-relative includes and the defines required for that shader variant. Entry point, target, include paths and definitions are saved in `shaders/<shader-hash>.compile.ini` alongside the source. Some games ship original source separately from the compiled shaders; matching that source and its build settings remains the mod author's responsibility.
+
+Texture detail panels provide **Edit PNG externally** for captured RGBA8/BGRA8 images and **Import PNG...** for matching-dimension replacements. The external edit action creates a replacement from the snapshot if needed and opens the existing file without overwriting edits. File watching reloads saved images; **Reload mods** is available when watching is disabled. Compressed and other non-RGBA8/BGRA8 formats currently use **Import native replacement...**, which requires every mip in tightly packed original format order. A `.mip0.bin` capture alone is insufficient for a multi-mip replacement. Writable resources and unsupported layouts show why replacement is unavailable.
 
 The shader browser includes DXBC disassembly, DXIL assembly using the bundled Microsoft DXC library, and GLSL source. Open **Shader disassembly/source** to read it; **Export disassembly** saves text in `captures/`. Original HLSL is not reconstructed from bytecode. SPIR-V still requires an external disassembler. Disassembly is cached per shader (128 entries / 64 MiB total, 8 MiB per entry), so viewing several shaders does not repeatedly disassemble them. DXC loads only when requested, from the add-on's own `ModKit-tools/` folder.
 
@@ -66,6 +72,8 @@ reshade-modkit/GameExecutable/
   shaders/<16-digit-shader-hash>.cso   # Direct3D bytecode
   shaders/<16-digit-shader-hash>.spv   # SPIR-V
   shaders/<16-digit-shader-hash>.glsl  # OpenGL source
+  shaders/<16-digit-shader-hash>.hlsl  # Replacement HLSL source
+  shaders/<16-digit-shader-hash>.compile.ini # HLSL compiler settings
   textures/<resource-id>.png
   textures/<resource-id>.bin
   buffers/<resource-id>.bin
@@ -132,7 +140,7 @@ Native preview hooks are installed on demand. The original command list retains 
 | Region labels | Native marker hooks from the former fork are not included; public SDK events do not expose them |
 | GPU timing | Opt-in D3D12 direct draw/indexed/dispatch/mesh actions; asynchronous per-submission timestamp readbacks |
 | Suppression comparison | Four alternating enabled/suppressed phases using CPU-observed present intervals |
-| Shader editing | GLSL; HLSL compilation for DXBC Shader Model 4/5; external compilation for DXIL/SPIR-V |
+| Shader editing | GLSL; reflected pixel starters and HLSL compilation for DXBC Shader Model 4/5 and DXIL Shader Model 6; external compilation for SPIR-V |
 | Readback | Implicit APIs; on-demand D3D12 color mip snapshots at observed legacy transitions; CPU uploads on other explicit paths |
 
 This is an inspector of intercepted command metadata and a graphics modding tool. It does not replay a frame offline, debug individual shader invocations, expose GPU performance counters, recover missing source code, or guarantee compatibility with injected overlays or games that restrict injection. Ray tracing pipeline replacement is disabled because it also requires rewriting shader binding tables. Native PIX and other marker payloads are not decoded by this add-on.
@@ -161,7 +169,7 @@ Results are CPU-observed present intervals with means, standard deviations, and 
 
 ## Build coverage
 
-A local MinGW cross build and Windows CI build compile the add-on. CI runs portable profile parsing, package/checksum checks and Windows checks for saved labels, execution points and texture snapshot guards. Version tags publish downloadable release ZIPs after these checks pass. This does not establish game compatibility, texture visualization or profiling accuracy under Proton; those need a real game run.
+A local MinGW cross build and Windows CI build compile the add-on. CI runs portable profile parsing, package/checksum checks and Windows checks for saved labels, execution points, texture snapshot guards and shader editing. Shader checks compile DXBC/DXIL originals and generated pixel replacements, verify output signatures, exercise nested includes and defines, and check failed compilation diagnostics. Version tags publish downloadable release ZIPs after these checks pass. This does not establish game compatibility, texture visualization or profiling accuracy under Proton; those need a real game run.
 
 ## References
 

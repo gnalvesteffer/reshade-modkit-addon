@@ -1,4 +1,4 @@
-"""Install the pinned Microsoft DXC disassembler beside an add-on package."""
+"""Install the pinned Microsoft DXC compiler, validator and disassembler."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -23,8 +23,9 @@ tools = args.destination / "ModKit-tools"
 tools.mkdir(exist_ok=True)
 with zipfile.ZipFile(archive) as package:
     names = {name.replace("\\", "/"): name for name in package.namelist()}
-    dll = "bin/" + args.architecture + "/dxcompiler.dll"
-    (tools / "dxcompiler.dll").write_bytes(package.read(names[dll]))
+    for dll in ("dxcompiler.dll", "dxil.dll"):
+        source = "bin/" + args.architecture + "/" + dll
+        (tools / dll).write_bytes(package.read(names[source]))
     for name in ("LICENSE-MS.txt", "LICENSE-LLVM.txt"):
         (tools / name).write_bytes(package.read(names[name]))
 if not args.archive:

@@ -15,7 +15,7 @@ def build_package(binary_dir, output_dir, version):
         raise ValueError("Version must be a vX.Y.Z tag, optional prerelease, or full commit SHA")
     repo = Path(__file__).resolve().parents[1]
     binary_dir, output_dir = Path(binary_dir), Path(output_dir)
-    for required in ("ModKit.addon64", "ModKit-tools/dxcompiler.dll", "ModKit-tools/LICENSE-MS.txt", "ModKit-tools/LICENSE-LLVM.txt"):
+    for required in ("ModKit.addon64", "ModKit-tools/dxcompiler.dll", "ModKit-tools/dxil.dll", "ModKit-tools/LICENSE-MS.txt", "ModKit-tools/LICENSE-LLVM.txt"):
         if not (binary_dir / required).is_file():
             raise FileNotFoundError(f"Required package file missing: {required}")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()

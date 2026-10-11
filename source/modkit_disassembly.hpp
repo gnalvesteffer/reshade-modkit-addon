@@ -17,17 +17,20 @@ inline std::filesystem::path dxc_library_path()
 	GetModuleFileNameW(module, path, 32768);
 	return std::filesystem::path(path).parent_path() / "ModKit-tools" / "dxcompiler.dll";
 }
-inline bool disassemble_dxil(const void *code, size_t size, std::string &text)
+inline DxcCreateInstanceProc load_dxc(std::string &error)
 {
 	if (!dxc_module)
 		dxc_module = LoadLibraryExW(dxc_library_path().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
 	if (!dxc_module)
-	{
-		text = "DXIL disassembly needs the bundled DXC library. Install ModKit-tools beside ModKit.addon64.\nExpected: " + dxc_library_path().u8string();
-		return false;
-	}
+	{ error = "Install the bundled ModKit-tools folder beside the add-on. Expected DXC library: " + dxc_library_path().u8string(); return nullptr; }
 	const auto create = reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(dxc_module, "DxcCreateInstance"));
-	if (!create) { text = "The DXC library does not export DxcCreateInstance."; return false; }
+	if (!create) error = "The DXC library does not export DxcCreateInstance.";
+	return create;
+}
+inline bool disassemble_dxil(const void *code, size_t size, std::string &text)
+{
+	const auto create = load_dxc(text);
+	if (!create) return false;
 	// Explicit SDK interface IDs also support MinGW, which does not implement
 	// Microsoft's uuid attributes on the vendored DXC forward declarations.
 	constexpr GUID compiler_id {0x228b4687, 0x5a6a, 0x4730, {0x90, 0x0c, 0x97, 0x02, 0xb2, 0x20, 0x3f, 0x54}};

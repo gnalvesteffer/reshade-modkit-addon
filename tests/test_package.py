@@ -18,7 +18,7 @@ class PackageChecks(unittest.TestCase):
             binary = root / "binary"
             (binary / "ModKit-tools").mkdir(parents=True)
             (binary / "ModKit.addon64").write_bytes(b"fixture-addon")
-            for name in ("dxcompiler.dll", "LICENSE-MS.txt", "LICENSE-LLVM.txt"):
+            for name in ("dxcompiler.dll", "dxil.dll", "LICENSE-MS.txt", "LICENSE-LLVM.txt"):
                 (binary / "ModKit-tools" / name).write_bytes(b"fixture")
             archive = package.build_package(binary, root / "dist", "v0.3.0-alpha.1")
             checksum = archive.with_suffix(".zip.sha256").read_text().split()[0]
@@ -26,6 +26,7 @@ class PackageChecks(unittest.TestCase):
             with zipfile.ZipFile(archive) as contents:
                 self.assertIn("ModKit.addon64", contents.namelist())
                 self.assertIn("ModKit-tools/dxcompiler.dll", contents.namelist())
+                self.assertIn("ModKit-tools/dxil.dll", contents.namelist())
                 self.assertIn("licenses/dxc/LICENSE-MS.txt", contents.namelist())
                 self.assertEqual(json.loads(contents.read("build-info.json"))["reshade_sdk_api"], 20)
                 for line in contents.read("SHA256SUMS").decode().splitlines():
@@ -41,6 +42,15 @@ class PackageChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="modkit-package-check-") as temporary:
             with self.assertRaises(FileNotFoundError):
                 package.build_package(Path(temporary), Path(temporary) / "dist", "v0.3.0")
+
+    def test_require_dxil_validator(self):
+        with tempfile.TemporaryDirectory(prefix="modkit-package-check-") as temporary:
+            binary = Path(temporary)
+            (binary / "ModKit.addon64").write_bytes(b"fixture")
+            (binary / "ModKit-tools").mkdir()
+            (binary / "ModKit-tools/dxcompiler.dll").write_bytes(b"fixture")
+            with self.assertRaisesRegex(FileNotFoundError, "dxil.dll"):
+                package.build_package(binary, binary / "dist", "v0.3.0")
 
 
 if __name__ == "__main__":

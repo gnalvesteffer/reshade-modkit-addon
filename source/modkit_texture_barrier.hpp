@@ -2,7 +2,7 @@
 #pragma once
 #include <d3d12.h>
 #include <cstdint>
-#include "../vendor/reshade/reshade_api_format.hpp"
+#include <reshade_api_format.hpp>
 
 namespace reshade::modkit
 {

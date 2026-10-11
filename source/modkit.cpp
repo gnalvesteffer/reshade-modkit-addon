@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
+#include <commdlg.h>
+#include <shellapi.h>
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
@@ -10,6 +12,7 @@
 #include "modkit_timing.hpp"
 #include "modkit_texture.hpp"
 #include "modkit_disassembly.hpp"
+#include "modkit_shader_edit.hpp"
 #include "modkit_labels.hpp"
 #include "modkit_effect_point.hpp"
 #include <stb_image.h>
@@ -235,6 +238,15 @@ struct device_state
 	std::filesystem::path editor_path;
 	bool editor_tab_requested = false;
 	std::string editor_note;
+	std::string editor_diagnostics;
+	bool editor_dirty = false;
+	bool editor_settings_dirty = false;
+	std::optional<std::filesystem::file_time_type> editor_file_time;
+	uintmax_t editor_file_size = 0;
+	uint64_t editor_shader = 0;
+	shader_interface editor_interface;
+	char editor_entry[128] = "main", editor_target[32] = {};
+	char editor_include_paths[4096] = {}, editor_defines[2048] = {};
 	std::unordered_map<uint64_t, disassembly_entry> disassemblies;
 	size_t disassembly_bytes = 0;
 	uint64_t disassembly_serial = 0;
@@ -1488,10 +1500,13 @@ static draw_record make_draw_record(device *dev, device_state &s, command_state 
 	if (!s.recording_frame && !s.capture_next && !s.live) return record;
 	for (auto &label : command.markers) { if (!record.marker.empty()) record.marker += " / "; record.marker += label; }
 	record.viewports = command.viewports; record.scissors = command.scissors; record.dynamic_states = command.dynamic_states;
-	record.output_target_count = command.target_count;
-	for (uint32_t i = 0; i < command.target_count; ++i)
+	// Dispatches do not use RTVs left bound by an earlier graphics draw.
+	record.output_target_count = compute ? 0 : command.target_count;
+	for (uint32_t i = 0; i < record.output_target_count && i < command.targets.size(); ++i)
 	{
+		if (!command.targets[i].handle) continue;
 		const auto target = dev->get_resource_from_view(command.targets[i]);
+		if (!target.handle) continue;
 		bool back_buffer = false;
 		for (const auto &runtime : s.runtimes) back_buffer |= runtime.first->get_current_back_buffer() == target;
 		record.back_buffer_target |= back_buffer;
@@ -1515,7 +1530,7 @@ static draw_record make_draw_record(device *dev, device_state &s, command_state 
 	if (!s.detailed_resources) return record;
 	for (auto &binding : command.vertices) add_resource(s, record, binding.second.buffer, "Vertex " + std::to_string(binding.first));
 	add_resource(s, record, command.index, "Index");
-	for (auto target : command.targets) if (auto view = s.views.find(target.handle); view != s.views.end()) add_resource(s, record, view->second.res, "Output/depth");
+	if (!compute) for (auto target : command.targets) if (auto view = s.views.find(target.handle); view != s.views.end()) add_resource(s, record, view->second.res, "Output/depth");
 	const auto relevant = compute ? shader_stage::all_compute : shader_stage::all_graphics;
 	for (auto &p : command.pushed) if ((p.stages & relevant) != shader_stage{})
 		add_descriptor_resource(s, record, p.value, "Binding " + std::to_string(p.update.binding));
@@ -1712,7 +1727,9 @@ static void render_effects_at_point(command_list *cmd, device_state &s, command_
 	if (command.target_count != 1 || !command.root_layouts[0].handle || command.pipelines.empty() || command.native_heaps.empty() || command.viewports.empty() || command.scissors.empty() || !command.dynamic_states.count(dynamic_state::primitive_topology))
 	{ s.early_status = "Matching draw lacks a single color target or sufficient observed state; ReShade effects will be skipped this frame."; return; }
 	auto dev = cmd->get_device();
+	if (command.targets.empty() || !command.targets.front().handle) return;
 	const auto target = dev->get_resource_from_view(command.targets.front());
+	if (!target.handle) return;
 	effect_runtime *runtime = nullptr;
 	for (auto &entry : s.runtimes) if (entry.first->get_command_queue() == command.last_queue) { runtime = entry.first; break; }
 	if (!runtime)
@@ -2055,8 +2072,34 @@ static resource_view make_preview(device *dev, device_state &s, resource_info &i
 	if (!dev->create_resource_view(res, resource_usage::shader_resource, desc, &info.preview)) return {};
 	s.owned_views.push_back(info.preview); return info.preview;
 }
+static std::filesystem::path choose_mod_file(const wchar_t *title, const wchar_t *filter)
+{
+	wchar_t path[32768] = {};
+	OPENFILENAMEW dialog {}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = GetActiveWindow();
+	dialog.lpstrTitle = title; dialog.lpstrFilter = filter; dialog.lpstrFile = path; dialog.nMaxFile = std::size(path);
+	dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+	return GetOpenFileNameW(&dialog) ? std::filesystem::path(path) : std::filesystem::path();
+}
+static bool publish_mod_file(const std::filesystem::path &path, const void *data, size_t size)
+{
+	const auto temporary = std::filesystem::path(path.wstring() + L".tmp");
+	const bool success = write_binary(temporary, data, size) && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+	if (!success) { std::error_code ec; std::filesystem::remove(temporary, ec); }
+	return success;
+}
+static void open_mod_path(device_state &s, const std::filesystem::path &path)
+{
+	if (reinterpret_cast<INT_PTR>(ShellExecuteW(GetActiveWindow(), L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+		report(s, "Could not open this path with a desktop application. Copy the path and open it manually: " + path.u8string());
+	else report(s, "Opened " + path.u8string());
+}
 static void png_write(void *context, void *data, int size)
 { static_cast<std::ofstream *>(context)->write(static_cast<const char *>(data), size); }
+static void png_buffer_write(void *context, void *data, int size)
+{
+	auto &bytes = *static_cast<std::vector<uint8_t> *>(context); const auto begin = static_cast<const uint8_t *>(data);
+	bytes.insert(bytes.end(), begin, begin + size);
+}
 static void export_resource(device_state &s, resource_info &info)
 {
 	if (info.captured.empty()) { report(s, "No CPU snapshot is available for this resource"); return; }
@@ -2073,29 +2116,67 @@ static void export_resource(device_state &s, resource_info &info)
 	}
 	report(s, success ? "Exported " + path.u8string() : "Resource export failed");
 }
-static void seed_resource(device_state &s, resource_info &info)
+static bool seed_resource(device_state &s, resource_info &info)
 {
 	if (info.desc.type == resource_type::buffer)
 	{
 		const auto path = s.root / "buffers" / (info.id + ".bin");
-		std::error_code ec; if (std::filesystem::exists(path, ec)) { report(s, "A buffer replacement file already exists"); return; }
-		if (!info.captured.empty() && write_binary(path, info.captured.data(), info.captured.size())) { s.reload_requested = true; report(s, "Created buffer replacement " + path.u8string()); }
-		else report(s, "No complete buffer snapshot is available");
+		std::error_code ec; if (std::filesystem::exists(path, ec)) return true;
+		if (info.captured.size() == info.desc.buffer.size && publish_mod_file(path, info.captured.data(), info.captured.size()))
+		{ s.reload_requested = true; report(s, "Created buffer replacement " + path.u8string()); return true; }
+		report(s, "No complete buffer snapshot is available");
 	}
-	else if (rgba_format(info.desc.texture.format) && !info.captured.empty())
+	else if (info.desc.type == resource_type::texture_2d && info.desc.texture.samples == 1 && info.desc.texture.depth_or_layers == 1 &&
+		rgba_format(info.desc.texture.format) && !info.captured.empty() && info.captured.size() <= 64 * 1024 * 1024 && info.captured.size() == uint64_t(info.desc.texture.width) * info.desc.texture.height * 4)
 	{
 		auto rgba = info.captured;
 		if (bgra_format(info.desc.texture.format)) for (size_t i = 0; i < rgba.size(); i += 4) std::swap(rgba[i], rgba[i + 2]);
 		const auto path = s.root / "textures" / (info.id + ".png");
-		std::error_code ec; if (std::filesystem::exists(path, ec)) { report(s, "A texture replacement file already exists"); return; }
-		std::ofstream output(path, std::ios::binary);
-		if (output && stbi_write_png_to_func(png_write, &output, static_cast<int>(info.desc.texture.width), static_cast<int>(info.desc.texture.height), 4, rgba.data(), static_cast<int>(info.desc.texture.width * 4))) { s.reload_requested = true; report(s, "Created texture replacement " + path.u8string()); }
+		std::error_code ec; if (std::filesystem::exists(path, ec)) return true;
+		std::vector<uint8_t> bytes;
+		if (stbi_write_png_to_func(png_buffer_write, &bytes, static_cast<int>(info.desc.texture.width), static_cast<int>(info.desc.texture.height), 4, rgba.data(), static_cast<int>(info.desc.texture.width * 4)) &&
+			publish_mod_file(path, bytes.data(), bytes.size()))
+		{ s.reload_requested = true; report(s, "Created texture replacement " + path.u8string()); return true; }
+		report(s, "Could not create the replacement PNG.");
 	}
 	else report(s, "Export the native data and supply a complete mip chain, or supply an RGBA8/BGRA8 PNG");
+	return false;
+}
+static void import_resource(device_state &s, resource_info &info, bool png)
+{
+	const auto source = choose_mod_file(png ? L"Import replacement PNG" : L"Import native replacement", png ? L"PNG image\0*.png\0\0" : L"Native packed resource\0*.bin\0\0");
+	if (source.empty()) return;
+	std::vector<uint8_t> bytes;
+	if (!read_binary(source, bytes) || bytes.size() > 64 * 1024 * 1024) { report(s, "Could not read replacement (maximum 64 MiB)."); return; }
+	const bool texture = info.desc.type == resource_type::texture_2d;
+	if (png)
+	{
+		int width = 0, height = 0, channels = 0;
+		if (!texture || !rgba_format(info.desc.texture.format) || bytes.size() < 8 || std::memcmp(bytes.data(), "\x89PNG\r\n\x1a\n", 8) ||
+			!stbi_info_from_memory(bytes.data(), static_cast<int>(bytes.size()), &width, &height, &channels) ||
+			width != static_cast<int>(info.desc.texture.width) || height != static_cast<int>(info.desc.texture.height) || uint64_t(width) * height * 4 > 64 * 1024 * 1024)
+		{ report(s, "Import needs a valid PNG with the original dimensions and an RGBA8/BGRA8 target (maximum 64 MiB decoded)."); return; }
+		int decoded_width = 0, decoded_height = 0;
+		auto pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &decoded_width, &decoded_height, &channels, 4);
+		if (!pixels) { report(s, "PNG decoding failed; the existing replacement is preserved."); return; }
+		stbi_image_free(pixels);
+	}
+	else
+	{
+		uint64_t expected = texture ? 0 : info.desc.buffer.size;
+		if (texture) for (uint32_t mip = 0; mip < info.desc.texture.levels; ++mip)
+			expected += format_slice_pitch(info.desc.texture.format, format_row_pitch(info.desc.texture.format, std::max(1u, info.desc.texture.width >> mip)), std::max(1u, info.desc.texture.height >> mip));
+		if (expected != bytes.size()) { report(s, "Native replacement must match the buffer size or complete tightly packed texture mip chain."); return; }
+	}
+	const auto path = s.root / (texture ? "textures" : "buffers") / (info.id + (png ? ".png" : ".bin"));
+	if (!publish_mod_file(path, bytes.data(), bytes.size())) { report(s, "Could not save the imported replacement."); return; }
+	info.disabled = false; s.reload_requested = true;
+	report(s, "Imported replacement. It applies when the game records new commands. Use Enable replacement to compare with the original.");
 }
 static bool matches_filter(device_state &s, const std::string &value) { return !s.filter[0] || value.find(s.filter) != std::string::npos; }
 static bool load_editor(device_state &s, const std::filesystem::path &path, const std::string &fallback)
 {
+	if (s.editor_dirty || s.editor_settings_dirty) { report(s, "Save or discard the current editor changes before opening another file."); return false; }
 	std::vector<uint8_t> bytes; std::error_code ec;
 	const bool exists = std::filesystem::exists(path, ec);
 	const auto size = exists ? std::filesystem::file_size(path, ec) : 0;
@@ -2106,32 +2187,206 @@ static bool load_editor(device_state &s, const std::filesystem::path &path, cons
 	s.editor.fill(0);
 	std::memcpy(s.editor.data(), content.data(), content.size());
 	s.editor_tab_requested = true;
+	s.editor_shader = 0; s.editor_diagnostics.clear(); s.editor_interface = {};
+	s.editor_file_time = exists ? std::optional<std::filesystem::file_time_type>(std::filesystem::last_write_time(path, ec)) : std::nullopt;
+	s.editor_file_size = size;
 	s.editor_note = exists ? "Loaded the existing file. Save writes your changes to this path." : "Loaded a new template. The file is created when you click Save.";
 	report(s, exists ? "Opened source in Editor / rules." : "Opened a replacement template in Editor / rules. Save creates the file.");
 	return true;
 }
-static std::string hlsl_target(const shader_info &shader)
+static void configure_shader_editor(device_state &s, const shader_info &shader)
 {
-	ID3D11ShaderReflection *reflection = nullptr;
-	if (FAILED(D3DReflect(shader.code.data(), shader.code.size(), IID_ID3D11ShaderReflection, reinterpret_cast<void **>(&reflection)))) return {};
-	D3D11_SHADER_DESC desc = {}; const auto result = reflection->GetDesc(&desc); reflection->Release();
-	if (FAILED(result)) return {};
-	std::string stage = stage_name(shader.stage); for (auto &c : stage) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-	return stage + "_" + std::to_string((desc.Version >> 4) & 15) + "_" + std::to_string(desc.Version & 15);
+	s.editor_shader = shader.hash;
+	if (shader.extension == ".cso") s.editor_interface = inspect_shader(shader.code.data(), shader.code.size());
+	const auto entry = shader.entry.empty() ? std::string("main") : shader.entry;
+	std::snprintf(s.editor_entry, sizeof(s.editor_entry), "%s", entry.c_str());
+	std::snprintf(s.editor_target, sizeof(s.editor_target), "%s", s.editor_interface.profile.c_str());
+	s.editor_include_paths[0] = s.editor_defines[0] = 0;
+	std::ifstream options(s.root / "shaders" / (hex_id(shader.hash) + ".compile.ini"), std::ios::binary | std::ios::ate);
+	if (options && options.tellg() <= 8192)
+	{
+		options.seekg(0); std::string line, includes, defines;
+		while (std::getline(options, line))
+		{
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			const auto equal = line.find('='); if (equal == std::string::npos) continue;
+			const auto key = line.substr(0, equal), value = line.substr(equal + 1);
+			if (key == "entry") std::snprintf(s.editor_entry, sizeof(s.editor_entry), "%s", value.c_str());
+			else if (key == "target") std::snprintf(s.editor_target, sizeof(s.editor_target), "%s", value.c_str());
+			else if (key == "include") includes += value + '\n';
+			else if (key == "define") defines += value + '\n';
+		}
+		if (includes.size() < sizeof(s.editor_include_paths)) std::memcpy(s.editor_include_paths, includes.c_str(), includes.size() + 1);
+		if (defines.size() < sizeof(s.editor_defines)) std::memcpy(s.editor_defines, defines.c_str(), defines.size() + 1);
+	}
+}
+static bool save_editor(device_state &s)
+{
+	if (!s.editor_path.empty())
+	{
+		std::error_code ec;
+		const bool exists = std::filesystem::exists(s.editor_path, ec);
+		const auto time = exists ? std::optional<std::filesystem::file_time_type>(std::filesystem::last_write_time(s.editor_path, ec)) : std::nullopt;
+		const auto size = exists ? std::filesystem::file_size(s.editor_path, ec) : 0;
+		if (ec) { report(s, "Could not check the editor file before saving."); return false; }
+		if (time != s.editor_file_time || size != s.editor_file_size)
+		{
+			if (s.editor_dirty) { report(s, "File changed externally. Save refused to preserve both versions. Copy your edits, then discard and reload the file."); return false; }
+			std::vector<uint8_t> bytes;
+			if (!exists || !read_binary(s.editor_path, bytes) || bytes.size() >= s.editor.size() || std::find(bytes.begin(), bytes.end(), uint8_t(0)) != bytes.end())
+			{ report(s, "File changed externally and cannot be reloaded as text. Previous editor contents retained."); return false; }
+			s.editor.fill(0); std::memcpy(s.editor.data(), bytes.data(), bytes.size());
+			s.editor_file_time = time; s.editor_file_size = size;
+		}
+	}
+	if (s.editor_path.empty() || !publish_mod_file(s.editor_path, s.editor.data(), std::strlen(s.editor.data())))
+	{ report(s, "Could not save the editor file."); return false; }
+	std::error_code ec; s.editor_file_time = std::filesystem::last_write_time(s.editor_path, ec); s.editor_file_size = std::strlen(s.editor.data());
+	if (s.editor_path.extension() == ".hlsl" && s.editor_shader)
+	{
+		std::string options = "entry=" + std::string(s.editor_entry) + "\ntarget=" + s.editor_target + '\n';
+		for (const auto &path : shader_option_lines(s.editor_include_paths)) options += "include=" + path + '\n';
+		for (const auto &define : shader_option_lines(s.editor_defines)) options += "define=" + define + '\n';
+		if (!publish_mod_file(s.root / "shaders" / (hex_id(s.editor_shader) + ".compile.ini"), options.data(), options.size()))
+		{ report(s, "Saved source, but could not save compiler settings."); return false; }
+	}
+	s.editor_dirty = s.editor_settings_dirty = false; s.reload_requested = true; report(s, "Saved " + s.editor_path.u8string()); return true;
 }
 static void compile_editor(device_state &s, const shader_info &shader)
 {
-	const auto target = hlsl_target(shader);
-	if (target.empty()) { report(s, "This shader needs an external compiler (for example DXC for Shader Model 6)"); return; }
-	ID3DBlob *code = nullptr, *errors = nullptr;
-	const auto result = D3DCompile(s.editor.data(), std::strlen(s.editor.data()), s.editor_path.u8string().c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, shader.entry.empty() ? "main" : shader.entry.c_str(), target.c_str(), D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
-	std::string diagnostic;
-	if (errors) { diagnostic.assign(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize()); errors->Release(); }
-	if (FAILED(result)) { report(s, diagnostic.empty() ? "HLSL compilation failed" : diagnostic); if (code) code->Release(); return; }
+	std::string target = s.editor_target, stage = stage_name(shader.stage);
+	for (auto &c : stage) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	if (target.size() != stage.size() + 4 || target.substr(0, stage.size() + 1) != stage + "_" ||
+		(target[stage.size() + 1] != '4' && target[stage.size() + 1] != '5' && target[stage.size() + 1] != '6') ||
+		target[stage.size() + 2] != '_' || target.back() < '0' || target.back() > '9' || !s.editor_entry[0])
+	{ s.editor_diagnostics = "Choose a target matching the original stage (for example ps_5_0 or ps_6_0) and an entry point."; return; }
+	std::vector<std::filesystem::path> directories;
+	for (const auto &path : shader_option_lines(s.editor_include_paths)) directories.push_back(std::filesystem::u8path(path));
+	std::vector<std::pair<std::string, std::string>> definitions;
+	if (!shader_definitions(s.editor_defines, definitions, s.editor_diagnostics)) return;
+	if (!save_editor(s)) { s.editor_diagnostics = s.status; return; }
+	std::vector<uint8_t> bytes; s.editor_diagnostics.clear();
+	if (target[stage.size() + 1] == '6')
+	{
+		if (!compile_dxil_source(s.editor.data(), s.editor_path, s.editor_entry, target, bytes, s.editor_diagnostics, directories, definitions))
+		{ report(s, "Compilation failed. See compiler output in the editor; the previous compiled replacement is preserved."); return; }
+	}
+	else
+	{
+		shader_com<ID3DBlob> code, errors;
+		std::vector<D3D_SHADER_MACRO> macros;
+		for (const auto &definition : definitions) macros.push_back({definition.first.c_str(), definition.second.c_str()});
+		macros.push_back({nullptr, nullptr}); shader_include_files includes(s.editor_path, directories);
+		const auto result = D3DCompile(s.editor.data(), std::strlen(s.editor.data()), s.editor_path.u8string().c_str(), macros.data(), &includes, s.editor_entry, target.c_str(), D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code.ptr, &errors.ptr);
+		if (errors.ptr) s.editor_diagnostics.assign(static_cast<const char *>(errors->GetBufferPointer()), errors->GetBufferSize());
+		while (!s.editor_diagnostics.empty() && s.editor_diagnostics.back() == '\0') s.editor_diagnostics.pop_back();
+		if (FAILED(result) || !code.ptr) { if (s.editor_diagnostics.empty()) s.editor_diagnostics = "HLSL compilation failed."; report(s, "Compilation failed. See compiler output in the editor; the previous compiled replacement is preserved."); return; }
+		const auto data = static_cast<const uint8_t *>(code->GetBufferPointer()); bytes.assign(data, data + code->GetBufferSize());
+	}
 	const auto path = s.root / "shaders" / (hex_id(shader.hash) + ".cso");
-	const bool success = write_binary(path, code->GetBufferPointer(), code->GetBufferSize()); code->Release();
-	if (success) { s.reload_requested = true; report(s, "Compiled " + target + "; replacement will apply to new draw recordings"); }
-	else report(s, "Could not save compiled shader");
+	if (publish_mod_file(path, bytes.data(), bytes.size()))
+	{ s.disabled_shaders.erase(shader.hash); s.reload_requested = true; s.editor_diagnostics += "\nCompiled " + target + ". Replacement enabled; it applies when the game records new commands. Disable Enable replacement to compare with the original."; report(s, "Compiled replacement saved; waiting for the game to use it."); }
+	else { s.editor_diagnostics += "\nCould not save compiled shader."; report(s, "Could not save compiled shader."); }
+}
+static void open_shader_editor(device_state &s, const shader_info &shader)
+{
+	if (s.editor_dirty || s.editor_settings_dirty) { report(s, "Save or discard current editor changes before opening a shader."); return; }
+	const bool same_shader = s.editor_shader == shader.hash;
+	const std::string previous_entry = s.editor_entry, previous_target = s.editor_target;
+	const std::string previous_includes = s.editor_include_paths, previous_defines = s.editor_defines;
+	if (shader.extension == ".glsl")
+	{
+		if (load_editor(s, s.root / "shaders" / (hex_id(shader.hash) + ".glsl"), std::string(shader.code.begin(), shader.code.end())))
+		{ configure_shader_editor(s, shader); s.editor_note = "Edit the captured GLSL or your existing replacement, then Save and apply."; }
+		return;
+	}
+	const auto info = inspect_shader(shader.code.data(), shader.code.size());
+	const auto starter = pixel_shader_starter(info, same_shader ? previous_entry : shader.entry);
+	const auto fallback = starter.empty() ? "#error Supply replacement HLSL or import a source file. Inspect the original interface and disassembly below.\n" : starter;
+	if (load_editor(s, s.root / "shaders" / (hex_id(shader.hash) + ".hlsl"), fallback))
+	{
+		configure_shader_editor(s, shader);
+		if (same_shader)
+		{
+			std::snprintf(s.editor_entry, sizeof(s.editor_entry), "%s", previous_entry.c_str());
+			std::snprintf(s.editor_target, sizeof(s.editor_target), "%s", previous_target.c_str());
+			std::snprintf(s.editor_include_paths, sizeof(s.editor_include_paths), "%s", previous_includes.c_str());
+			std::snprintf(s.editor_defines, sizeof(s.editor_defines), "%s", previous_defines.c_str());
+		}
+		s.editor_note = "Original HLSL is unavailable. This edits replacement source. A generated pixel starter outputs magenta and changes the original shading; inspect the original interface before writing a full replacement.";
+	}
+}
+static void import_shader_source(device_state &s, const shader_info &shader)
+{
+	if (s.editor_dirty || s.editor_settings_dirty) { report(s, "Save or discard current editor changes before importing source."); return; }
+	const auto source = choose_mod_file(L"Import replacement source", shader.extension == ".glsl" ? L"GLSL source\0*.glsl\0\0" : L"HLSL source\0*.hlsl;*.fx\0\0");
+	if (source.empty()) return;
+	std::vector<uint8_t> bytes;
+	if (!read_binary(source, bytes) || bytes.size() >= s.editor.size() || std::find(bytes.begin(), bytes.end(), uint8_t(0)) != bytes.end())
+	{ report(s, "Source must be a readable text file smaller than 64 KiB."); return; }
+	const auto path = s.root / "shaders" / (hex_id(shader.hash) + (shader.extension == ".glsl" ? ".glsl" : ".hlsl"));
+	if (!publish_mod_file(path, bytes.data(), bytes.size())) { report(s, "Could not import source."); return; }
+	s.reload_requested = true;
+	open_shader_editor(s, shader);
+	if (shader.extension != ".glsl" && s.editor_shader == shader.hash)
+	{
+		const auto directory = source.parent_path().u8string();
+		const auto paths = shader_option_lines(s.editor_include_paths);
+		if (std::find(paths.begin(), paths.end(), directory) == paths.end())
+		{
+			const auto includes = directory + '\n' + s.editor_include_paths;
+			if (includes.size() < sizeof(s.editor_include_paths)) std::memcpy(s.editor_include_paths, includes.c_str(), includes.size() + 1);
+		}
+		s.editor_note += " The imported file's original directory is an include search path. Add the game's source root and required defines below if its headers use additional paths.";
+		save_editor(s);
+	}
+}
+static void import_shader_bytecode(device_state &s, const shader_info &shader)
+{
+	const auto source = choose_mod_file(L"Import compiled shader replacement", shader.extension == ".spv" ? L"SPIR-V shader\0*.spv\0\0" : L"Direct3D compiled shader\0*.cso;*.dxbc;*.dxil\0\0");
+	if (source.empty()) return;
+	std::vector<uint8_t> bytes;
+	if (!read_binary(source, bytes) || bytes.size() < 4 || bytes.size() > 64 * 1024 * 1024)
+	{ report(s, "Could not read the compiled shader (maximum 64 MiB)."); return; }
+	if (shader.extension == ".cso")
+	{
+		if (std::memcmp(bytes.data(), "DXBC", 4) != 0) { report(s, "Expected a DXBC/DXIL shader container."); return; }
+		const auto replacement = inspect_shader(bytes.data(), bytes.size());
+		std::string stage = stage_name(shader.stage); for (auto &c : stage) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		if (!replacement.profile.empty() && replacement.profile.substr(0, stage.size() + 1) != stage + "_")
+		{ report(s, "The imported shader has a different stage from the selected shader."); return; }
+	}
+	else if (bytes.size() < 20 || bytes.size() % 4 || bytes[0] != 3 || bytes[1] != 2 || bytes[2] != 35 || bytes[3] != 7)
+	{ report(s, "Expected SPIR-V bytecode."); return; }
+	const auto path = s.root / "shaders" / (hex_id(shader.hash) + shader.extension);
+	if (!publish_mod_file(path, bytes.data(), bytes.size())) { report(s, "Could not import compiled shader."); return; }
+	s.disabled_shaders.erase(shader.hash); s.reload_requested = true;
+	report(s, "Imported compiled replacement. It applies when the game records new commands; check the status if pipeline creation fails.");
+}
+static disassembly_entry &shader_disassembly(device_state &s, const shader_info &shader)
+{
+	if (!s.disassemblies.count(shader.hash))
+	{
+		std::string text;
+		if (shader.extension == ".glsl") text.assign(shader.code.begin(), shader.code.end());
+		else if (shader.extension == ".cso")
+		{
+			shader_com<ID3DBlob> assembly;
+			if (SUCCEEDED(D3DDisassemble(shader.code.data(), shader.code.size(), 0, nullptr, &assembly.ptr)) && assembly.ptr)
+				text.assign(static_cast<const char *>(assembly->GetBufferPointer()), assembly->GetBufferSize());
+			else if (disassemble_dxil(shader.code.data(), shader.code.size(), text))
+				text.insert(0, "; DXIL assembly. Original HLSL is not reconstructed from compiled bytecode.\n\n");
+		}
+		if (text.size() > 8 * 1024 * 1024) text = "Shader disassembly exceeds the 8 MiB display limit.";
+		if (text.empty()) text = shader.extension == ".spv" ? "SPIR-V requires an external disassembler. Export the shader bytecode first." : "No readable source or disassembly is available for this shader.";
+		while (!s.disassemblies.empty() && (s.disassembly_bytes + text.size() > 64 * 1024 * 1024 || s.disassemblies.size() >= 128))
+		{
+			const auto oldest = std::min_element(s.disassemblies.begin(), s.disassemblies.end(), [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
+			s.disassembly_bytes -= oldest->second.text.size(); s.disassemblies.erase(oldest);
+		}
+		s.disassembly_bytes += text.size(); s.disassemblies.emplace(shader.hash, disassembly_entry {std::move(text), 0});
+	}
+	auto &assembly = s.disassemblies.at(shader.hash); assembly.used = ++s.disassembly_serial; return assembly;
 }
 static void show_shader(device_state &s, shader_info &shader)
 {
@@ -2171,47 +2426,25 @@ static void show_shader(device_state &s, shader_info &shader)
 	if (ImGui::Button("Compare suppression performance")) { s.selected_shader = shader.hash; start_comparison(s, shader.hash); }
 	ImGui::EndDisabled();
 	const auto path = s.root / "shaders" / (hex_id(shader.hash) + shader.extension);
-	ImGui::TextWrapped("Replacement: %s", path.u8string().c_str());
-	if (ImGui::Button("Export original shader")) report(s, write_binary(s.root / "captures" / path.filename(), shader.code.data(), shader.code.size()) ? "Shader exported to captures/" : "Shader export failed");
-	ImGui::SameLine();
-	if (ImGui::Button("Create replacement"))
+	ImGui::SeparatorText("Modify this shader");
+	if (file_present(s, path)) ImGui::Text("Replacement file installed%s", enabled ? "" : " (disabled)");
+	else ImGui::TextDisabled("Original shader active. No replacement file installed.");
+	if (shader.extension != ".spv")
 	{
-		if (file_present(s, path)) report(s, "A replacement file already exists");
-		else if (write_binary(path, shader.code.data(), shader.code.size())) { s.reload_requested = true; report(s, "Created " + path.u8string()); }
+		if (ImGui::Button(shader.extension == ".glsl" ? "Edit GLSL source" : "Open replacement editor")) open_shader_editor(s, shader);
+		ImGui::SameLine(); if (ImGui::Button("Import source...")) import_shader_source(s, shader);
+		ImGui::TextWrapped(shader.extension == ".glsl" ? "Edit the captured GLSL, then save to apply it." :
+			"Open the editor to inspect the original interface and write replacement HLSL. Pixel shaders can start with a generated magenta-output shader. Compile and apply from the editor.");
 	}
-	ImGui::SameLine();
-	if (ImGui::Button("Edit source"))
-	{
-		if (shader.extension == ".glsl") load_editor(s, path, std::string(shader.code.begin(), shader.code.end()));
-		else if (load_editor(s, s.root / "shaders" / (hex_id(shader.hash) + ".hlsl"), "// Replacement for " + hex_id(shader.hash) + "\n// The original source is not available in this editor.\n// Supply HLSL with the same entry point and input/output/resource interface.\n"))
-			s.editor_note += " This is replacement HLSL, not recovered original source. DXIL/Shader Model 6 and SPIR-V need external compilation. Use Shader disassembly/source to inspect the compiled shader.";
-	}
-	if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open replacement source in Editor / rules. Compiled shaders without a replacement source file open a template.");
+	else ImGui::TextWrapped("This is compiled SPIR-V. Export it for inspection, author compatible source in an external tool, then import compiled SPIR-V.");
+	if (shader.extension != ".glsl" && ImGui::Button("Import compiled replacement...")) import_shader_bytecode(s, shader);
+	if (ImGui::Button(shader.extension == ".glsl" ? "Export original source" : "Export original bytecode")) report(s, write_binary(s.root / "captures" / path.filename(), shader.code.data(), shader.code.size()) ? "Shader exported to captures/" : "Shader export failed");
+	ImGui::SameLine(); if (ImGui::Button("Open shader folder")) open_mod_path(s, path.parent_path());
+	ImGui::SameLine(); if (ImGui::Button("Copy replacement path")) ImGui::SetClipboardText(path.u8string().c_str());
+	ImGui::TextWrapped("Replacement file: %s", path.u8string().c_str());
 	if (ImGui::CollapsingHeader("Shader disassembly/source"))
 	{
-		if (!s.disassemblies.count(shader.hash))
-		{
-			std::string text;
-			if (shader.extension == ".glsl") text.assign(shader.code.begin(), shader.code.end());
-			else if (shader.extension == ".cso")
-			{
-				ID3DBlob *assembly = nullptr;
-				if (SUCCEEDED(D3DDisassemble(shader.code.data(), shader.code.size(), 0, nullptr, &assembly)) && assembly)
-					text.assign(static_cast<const char *>(assembly->GetBufferPointer()), assembly->GetBufferSize());
-				else if (disassemble_dxil(shader.code.data(), shader.code.size(), text))
-					text.insert(0, "; DXIL assembly. The original HLSL source is not reconstructed from compiled bytecode.\n\n");
-				if (assembly) assembly->Release();
-			}
-			if (text.size() > 8 * 1024 * 1024) text = "Shader disassembly exceeds the 8 MiB display limit.";
-			if (text.empty()) text = shader.extension == ".spv" ? "SPIR-V disassembly currently requires an external SPIR-V tool. Export the shader bytecode first." : "No readable source or disassembly is available for this shader.";
-			while (!s.disassemblies.empty() && (s.disassembly_bytes + text.size() > 64 * 1024 * 1024 || s.disassemblies.size() >= 128))
-			{
-				const auto oldest = std::min_element(s.disassemblies.begin(), s.disassemblies.end(), [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
-				s.disassembly_bytes -= oldest->second.text.size(); s.disassemblies.erase(oldest);
-			}
-			s.disassembly_bytes += text.size(); s.disassemblies.emplace(shader.hash, disassembly_entry {std::move(text), 0});
-		}
-		auto &assembly = s.disassemblies.at(shader.hash); assembly.used = ++s.disassembly_serial;
+		auto &assembly = shader_disassembly(s, shader);
 		const bool retry = ImGui::Button("Retry disassembly");
 		ImGui::SameLine(); if (ImGui::Button("Export disassembly")) report(s, write_binary(s.root / "captures" / (hex_id(shader.hash) + ".asm.txt"), assembly.text.data(), assembly.text.size()) ? "Disassembly exported to captures/" : "Disassembly export failed");
 		ImGui::BeginChild("assembly", ImVec2(0, 230), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
@@ -2237,8 +2470,37 @@ static void show_resource(effect_runtime *runtime, device_state &s, resource_inf
 	}
 	if (ImGui::Button("Snapshot GPU contents")) { if (capture_gpu(runtime, s, info)) info.preview = {}; }
 	ImGui::SameLine(); if (ImGui::Button("Export data")) export_resource(s, info);
-	ImGui::SameLine(); if (ImGui::Button("Create replacement")) seed_resource(s, info);
-	ImGui::TextWrapped("Replacement: %s/%s.%s", (s.root / (info.desc.type == resource_type::buffer ? "buffers" : "textures")).u8string().c_str(), info.id.c_str(), info.desc.type == resource_type::buffer ? "bin" : "png or bin");
+	ImGui::SeparatorText(info.desc.type == resource_type::buffer ? "Modify this buffer" : "Modify this texture");
+	const bool texture = info.desc.type == resource_type::texture_2d;
+	const bool replaceable = !writable_resource(info.desc) && (info.desc.type == resource_type::buffer ||
+		(texture && info.desc.texture.samples == 1 && info.desc.texture.depth_or_layers == 1 && info.desc.texture.levels > 0 && info.desc.texture.levels <= 16));
+	const bool editable_png = texture && rgba_format(info.desc.texture.format);
+	const auto folder = s.root / (info.desc.type == resource_type::buffer ? "buffers" : "textures");
+	const auto png_path = folder / (info.id + ".png"), native_path = folder / (info.id + ".bin");
+	ImGui::BeginDisabled(!replaceable);
+	if (editable_png)
+	{
+		ImGui::TextWrapped("1. Create an editable PNG from a snapshot. 2. Edit it in your image editor and save. 3. Return here; watched files reload automatically, or use Reload mods.");
+		ImGui::BeginDisabled(info.captured.empty() && !file_present(s, png_path));
+		if (ImGui::Button("Edit PNG externally")) if (seed_resource(s, info)) open_mod_path(s, png_path);
+		ImGui::EndDisabled();
+		ImGui::SameLine(); if (ImGui::Button("Import PNG...")) import_resource(s, info, true);
+		if (info.captured.empty()) ImGui::TextWrapped("No original pixels captured yet. Request a GPU snapshot, or import your own PNG with matching dimensions.");
+		ImGui::Text("PNG dimensions: %u x %u. Mips are rebuilt automatically.", info.desc.texture.width, info.desc.texture.height);
+	}
+	else if (texture) ImGui::TextWrapped("This texture's format needs a native replacement. Export the base mip for inspection, then use external texture tools to supply a .bin containing all mips in the original format. PNG editing is currently limited to RGBA8/BGRA8 textures.");
+	else if (info.desc.type == resource_type::buffer)
+	{
+		if (ImGui::Button("Create buffer replacement")) seed_resource(s, info);
+		ImGui::TextWrapped("Edit the replacement with external binary tools, keeping the original byte size.");
+	}
+	if (ImGui::Button("Import native replacement...")) import_resource(s, info, false);
+	ImGui::EndDisabled();
+	if (!replaceable) ImGui::TextWrapped("Replacement is unavailable for this resource type, usage or layout. You can inspect and export captured data.");
+	if (ImGui::Button("Open replacement folder")) open_mod_path(s, folder);
+	ImGui::SameLine(); if (ImGui::Button("Copy replacement path")) ImGui::SetClipboardText((editable_png ? png_path : native_path).u8string().c_str());
+	ImGui::TextWrapped("Replacement: %s", (editable_png ? png_path : native_path).u8string().c_str());
+	if (texture && file_present(s, png_path) && file_present(s, native_path)) ImGui::TextWrapped("Both PNG and native replacements exist. PNG takes precedence; remove it to use the native file.");
 	if (!info.error.empty()) ImGui::TextWrapped("%s", info.error.c_str());
 	if (info.desc.type == resource_type::texture_2d)
 	{
@@ -2527,19 +2789,90 @@ static void draw_panel(effect_runtime *runtime)
 		{
 			s.editor_tab_requested = false;
 			if (ImGui::Button("Edit draw rules")) load_editor(s, s.root / "rules.ini", "; Draw rules\n");
-			ImGui::SameLine(); if (ImGui::Button("Save"))
+			if (s.editor_path.empty()) ImGui::TextWrapped("Select a shader and choose Open replacement editor or Import source. Texture images are edited externally from their detail panel.");
+			else
 			{
-				if (!s.editor_path.empty() && write_binary(s.editor_path, s.editor.data(), std::strlen(s.editor.data()))) { s.reload_requested = true; report(s, "Saved " + s.editor_path.u8string()); }
+				const bool hlsl = s.editor_path.extension() == ".hlsl";
+				const auto shader = s.shaders.find(s.editor_shader);
+				ImGui::TextWrapped("File: %s", s.editor_path.u8string().c_str());
+				if (s.editor_dirty || s.editor_settings_dirty) ImGui::TextDisabled("Unsaved source or compiler settings");
+				if (!s.editor_note.empty()) ImGui::TextWrapped("%s", s.editor_note.c_str());
+				if (hlsl && shader != s.shaders.end())
+				{
+					ImGui::SetNextItemWidth(140); if (ImGui::InputText("Target profile", s.editor_target, sizeof(s.editor_target))) s.editor_settings_dirty = true;
+					ImGui::SameLine(); ImGui::SetNextItemWidth(140); if (ImGui::InputText("Entry point", s.editor_entry, sizeof(s.editor_entry))) s.editor_settings_dirty = true;
+					ImGui::TextWrapped("Edit replacement HLSL, then Compile and apply. SM4/5 uses D3DCompiler; SM6 uses the bundled DXC compiler and validator.");
+					if (ImGui::CollapsingHeader("Compiler settings: includes and defines"))
+					{
+						ImGui::TextWrapped("Include directories: one path per line. Imported source adds its original directory; add the game/source root for includes relative to that root.");
+						if (ImGui::InputTextMultiline("##include_dirs", s.editor_include_paths, sizeof(s.editor_include_paths), ImVec2(-1, 60))) s.editor_settings_dirty = true;
+						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line. Use the original shader variant's defines when available. Settings are saved with the source.");
+						if (ImGui::InputTextMultiline("##defines", s.editor_defines, sizeof(s.editor_defines), ImVec2(-1, 60))) s.editor_settings_dirty = true;
+					}
+					if (shader->second.stage == pipeline_subobject_type::pixel_shader)
+					{
+						ImGui::BeginDisabled(s.editor_dirty);
+						if (ImGui::Button("Generate pixel shader starter"))
+						{
+							const auto source = pixel_shader_starter(s.editor_interface, s.editor_entry);
+							if (source.empty() || source.size() >= s.editor.size()) s.editor_diagnostics = "Cannot generate a pixel starter for this shader's reflection/output signature. Import compatible HLSL or compiled bytecode instead.";
+							else { s.editor.fill(0); std::memcpy(s.editor.data(), source.data(), source.size()); s.editor_dirty = true; s.editor_diagnostics = "Generated magenta-output diagnostic shader. Edit the color or write your own shading, then Compile and apply."; }
+						}
+						ImGui::EndDisabled();
+						if (ImGui::IsItemHovered()) ImGui::SetTooltip("Replaces editor text with a diagnostic shader. Save or discard unsaved edits first. Does not preserve original lighting.");
+					}
+				}
+				if (ImGui::Button(hlsl ? "Save source" : "Save and apply"))
+					if (save_editor(s) && shader != s.shaders.end() && !hlsl) s.disabled_shaders.erase(shader->first);
+				if (hlsl && shader != s.shaders.end())
+				{
+					ImGui::SameLine(); if (ImGui::Button("Compile and apply")) compile_editor(s, shader->second);
+				}
+				ImGui::SameLine(); if (ImGui::Button("Copy file path")) ImGui::SetClipboardText(s.editor_path.u8string().c_str());
+				ImGui::BeginDisabled(s.editor_dirty || s.editor_settings_dirty); ImGui::SameLine();
+				if (ImGui::Button("Open externally")) if (save_editor(s)) open_mod_path(s, s.editor_path);
+				ImGui::SameLine(); if (ImGui::Button("Reload file"))
+				{
+					if (shader != s.shaders.end()) open_shader_editor(s, shader->second);
+					else load_editor(s, s.editor_path, "; Draw rules\n");
+				}
+				ImGui::EndDisabled();
+				if ((s.editor_dirty || s.editor_settings_dirty) && ImGui::Button("Discard unsaved changes"))
+				{
+					s.editor_dirty = s.editor_settings_dirty = false; s.editor_shader = 0;
+					if (shader != s.shaders.end()) open_shader_editor(s, shader->second);
+					else load_editor(s, s.editor_path, "; Draw rules\n");
+				}
+				if (ImGui::InputTextMultiline("##editor", s.editor.data(), s.editor.size(), ImVec2(-1, 300), ImGuiInputTextFlags_AllowTabInput)) s.editor_dirty = true;
+				if (!s.editor_diagnostics.empty())
+				{
+					ImGui::SeparatorText("Compiler / editor output");
+					ImGui::BeginChild("compiler_output", ImVec2(0, 120), ImGuiChildFlags_Borders);
+					ImGui::TextWrapped("%s", s.editor_diagnostics.c_str()); ImGui::EndChild();
+				}
+				if (hlsl && shader != s.shaders.end())
+				{
+					if (ImGui::CollapsingHeader("Original shader interface", ImGuiTreeNodeFlags_DefaultOpen))
+					{
+						const auto &info = s.editor_interface;
+						if (!info.error.empty()) ImGui::TextWrapped("%s", info.error.c_str());
+						ImGui::Text("Original profile: %s", info.profile.empty() ? "unavailable; supply a compatible target" : info.profile.c_str());
+						ImGui::TextUnformatted("Inputs:");
+						for (const auto &param : info.inputs) ImGui::BulletText("%s : %s", param.type.c_str(), parameter_semantic(param).c_str());
+						ImGui::TextUnformatted("Outputs:");
+						for (const auto &param : info.outputs) ImGui::BulletText("%s : %s", param.type.c_str(), parameter_semantic(param).c_str());
+						ImGui::TextUnformatted("Resource bindings:"); ImGui::TextUnformatted(info.bindings.empty() ? "None available." : info.bindings.c_str());
+					}
+					if (ImGui::CollapsingHeader("Original shader disassembly (reference)"))
+					{
+						auto &reference = shader_disassembly(s, shader->second);
+						if (ImGui::Button("Copy original disassembly")) ImGui::SetClipboardText(reference.text.c_str());
+						ImGui::BeginChild("editor_reference", ImVec2(0, 260), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+						ImGui::TextUnformatted(reference.text.c_str()); ImGui::EndChild();
+					}
+				}
+				else if (s.editor_path.filename() == "rules.ini") ImGui::TextWrapped("Rules match shader ID, action kind, count and instances. Skip or modify draw parameters. Saved changes apply when the game records new commands.");
 			}
-			ImGui::TextWrapped("%s", s.editor_path.u8string().c_str());
-			if (!s.editor_note.empty()) ImGui::TextWrapped("%s", s.editor_note.c_str());
-			ImGui::InputTextMultiline("##editor", s.editor.data(), s.editor.size(), ImVec2(-1, 350), ImGuiInputTextFlags_AllowTabInput);
-			if (s.editor_path.extension() == ".hlsl")
-			{
-				uint64_t hash = 0; number(s.editor_path.stem().u8string(), hash, true);
-				if (auto it = s.shaders.find(hash); it != s.shaders.end()) if (ImGui::Button("Compile HLSL and apply")) compile_editor(s, it->second);
-			}
-			ImGui::TextWrapped("Rules match shader ID, action kind, count and instances. Skip or modify draw parameters. First edits apply when the game records new draw commands.");
 			ImGui::EndTabItem();
 		}
 		if (ImGui::BeginTabItem("Session"))

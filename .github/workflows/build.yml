@@ -72,11 +72,12 @@ jobs:
         run: |
           cmake -S . -B build -A x64 -DMODKIT_BUILD_CHECKS=ON
           cmake --build build --config Release --parallel
-      - name: Check profiles, labels and execution point persistence
+      - name: Fetch DXIL compiler, validator and disassembler
+        run: python scripts/fetch-dxc.py --destination build/Release
+      - name: Check profiles, shader editing and execution point persistence
         run: ctest --test-dir build -C Release --output-on-failure
-      - name: Package DXIL disassembler and installable ZIP
+      - name: Package installable ZIP
         run: |
-          python scripts/fetch-dxc.py --destination build/Release
           python scripts/package.py --binary-dir build/Release --output-dir dist --version "$env:PACKAGE_VERSION"
       - uses: actions/upload-artifact@v7
         with:
