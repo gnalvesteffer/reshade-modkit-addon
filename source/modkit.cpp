@@ -2261,7 +2261,7 @@ static void compile_editor(device_state &s, const shader_info &shader)
 		target[stage.size() + 2] != '_' || target.back() < '0' || target.back() > '9' || !s.editor_entry[0])
 	{ s.editor_diagnostics = "Choose a target matching the original stage (for example ps_5_0 or ps_6_0) and an entry point."; return; }
 	std::vector<std::filesystem::path> directories;
-	for (const auto &path : shader_option_lines(s.editor_include_paths)) directories.push_back(std::filesystem::u8path(path));
+	if (!parse_include_dirs(s.editor_include_paths, directories, s.editor_diagnostics)) return;
 	std::vector<std::pair<std::string, std::string>> definitions;
 	if (!shader_definitions(s.editor_defines, definitions, s.editor_diagnostics)) return;
 	if (!save_editor(s)) { s.editor_diagnostics = s.status; return; }

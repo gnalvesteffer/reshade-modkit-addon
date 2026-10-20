@@ -50,11 +50,23 @@ inline bool shader_definitions(const std::string &text, std::vector<std::pair<st
 {
 	for (const auto &line : shader_option_lines(text))
 	{
+		if (line.size() > 4096) { error = "Defines need one NAME or NAME=VALUE per line; each line must be at most 4096 characters."; return false; }
 		const auto equal = line.find('='); const auto name = line.substr(0, equal);
 		if (name.empty() || (!std::isalpha(static_cast<unsigned char>(name[0])) && name[0] != '_') ||
 			std::any_of(name.begin(), name.end(), [](unsigned char c) { return !std::isalnum(c) && c != '_'; }))
 		{ error = "Defines need one NAME or NAME=VALUE per line; macro names must be identifiers."; return false; }
+		if (definitions.size() == 256) { error = "At most 256 defines are allowed per shader."; return false; }
 		definitions.emplace_back(name, equal == std::string::npos ? "1" : line.substr(equal + 1));
+	}
+	return true;
+}
+inline bool parse_include_dirs(const std::string &text, std::vector<std::filesystem::path> &directories, std::string &error)
+{
+	for (const auto &line : shader_option_lines(text)) // Empty lines are skipped by shader_option_lines.
+	{
+		if (line.size() > 4096) { error = "Include paths need one directory per line; each line must be at most 4096 characters."; return false; }
+		if (directories.size() == 32) { error = "At most 32 include directories are allowed per shader."; return false; }
+		directories.push_back(std::filesystem::u8path(line));
 	}
 	return true;
 }
