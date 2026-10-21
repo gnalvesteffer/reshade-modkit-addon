@@ -10,7 +10,7 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 
 ## Assigned to worktrees
 
-### Slice A — branch `improve/shader-editor-qol`
+### Slice A — branch `improve/shader-editor-qol` (PR #2, all 4 role reviews APPROVE on fix commit ee9cf1d, CI green)
 - **[qol] Open mod directory from the UI.** The Session tab prints the mod root path
   as text, but there is no button to reveal it in Explorer. Add an "Open mod folder"
   button next to the path (reuse `open_mod_path`). *modkit.cpp `draw_panel`.*
@@ -24,7 +24,7 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
   and report a full-profile mismatch up front. *modkit.cpp `import_shader_bytecode`.*
 - **[docs] Document the above** in MODKIT.md (editor / rules section).
 
-### Slice B — branch `harden/parsing-tests`
+### Slice B — branch `harden/parsing-tests` (PR #1, all 4 role reviews APPROVE on fix commit 70e31a6, CI green)
 - **[defect/robustness] Unbounded shader macros & include dirs.** `shader_definitions`
   and the include-dir list have no cap; a crafted `.compile.ini` or pasted editor input
   can supply an unbounded number of `-D` / `-I` arguments. Add sane caps with clear
@@ -35,20 +35,24 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 - **[test] Add regression tests** for the new caps and validation in
   `tests/shader_edit_checks.cpp` (and `profile_checks.cpp` where relevant).
 
-### Slice C — branch `improve/profiler-frame-ux`
+### Slice C — branch `improve/profiler-frame-ux` (PR #3, fix commit 8061c8e landed, CI green; code-correctness re-review in flight)
 - **[ux] Profiler/frame UX.** Improve the Profiler and Frame/pipeline tabs: clearer
   empty-state guidance, consistent column/label naming, and a visible indicator when
   the displayed frame is stale (pre-timing readback). *modkit.cpp `show_profiler`,
   `show_draws`.*
 - **[docs] Document profiler/capture behavior** in MODKIT.md.
 
+### Slice D — branch `harden/poll-files-state` (PR #4, CI green; all 4 role reviews in flight)
+- **[defect/robustness] Unbounded function-local static in `poll_files`.** The
+  `static std::map<std::filesystem::path, std::filesystem::file_time_type> rule_times;`
+  at modkit.cpp ~1272 grows per distinct rules.ini path and is never freed on device
+  destroy. Move the last-seen timestamp into `device_state` (freed with the device)
+  and drop the static. *modkit.cpp `poll_files`, `device_state`.*
+- **[qol] Cosmetic indentation in `poll_files`.** Lines ~1267, 1269, 1280 were
+  reported as unindented (suspected merge artifact). Verified during implementation:
+  those lines are already correctly indented at one tab in origin/main — no-op.
+
 ## Reviewed / deferred (noted, not yet scheduled)
-- **[qol] Cosmetic indentation** in `poll_files` (`s.files.swap(latest);` and
-  `s.reload_requested = false;`) is unindented vs. the block — likely a merge artifact.
-  Low value; fold into whichever slice touches nearby code if convenient.
-- **[qol] Function-local static `rule_times` map** in `poll_files` grows per distinct
-  rules.ini path and is never freed on device destroy. Bounded in practice (few
-  devices); move into `device_state` if a slice already edits that area.
 - **[feature] In-editor syntax highlighting / line numbers.** The editor is an ImGui
   `InputTextMultiline`; a lightweight embedded text editor would be a large change and
   is out of scope for the current pass.
@@ -58,3 +62,8 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 - Every PR is reviewed by role-focused subagents with clean context (code correctness,
   memory safety, UX/QoL, build/CI) — see `.agents/skills/pr-review` and the
   `reviewer-*` skills.
+- Before merging all four PRs to main, an integration branch (`int/combined`) merges
+  them in order (#1 → #2 → #3 → #4), resolves any cross-PR overlap (modkit.cpp,
+  modkit_shader_edit.hpp, shader_edit_checks.cpp), and runs the full local + CI
+  verification on the combined tree. Then each PR merges to main individually in the
+  same order.

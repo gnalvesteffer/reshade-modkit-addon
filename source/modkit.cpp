@@ -220,6 +220,7 @@ struct device_state
 	std::deque<std::pair<uint64_t, std::vector<draw_record>>> timed_frames;
 	uint64_t displayed_frame_index = 0;
 	std::vector<draw_rule> rules;
+	std::filesystem::file_time_type rules_time{};
 	std::unordered_set<uint64_t> suppressed_shaders, disabled_shaders;
 	std::map<std::filesystem::path, file_info> files;
 	size_t capture_bytes = 0, replacement_bytes = 0;
@@ -1269,11 +1270,10 @@ static void poll_files(device_state &s)
 	s.files.swap(latest);
 	const auto rules_path = s.root / "rules.ini";
 	const auto rules_time = std::filesystem::last_write_time(rules_path, ec);
-	static std::map<std::filesystem::path, std::filesystem::file_time_type> rule_times;
-	if (!ec && (!s.rules_loaded || s.reload_requested || rule_times[rules_path] != rules_time))
+	if (!ec && (!s.rules_loaded || s.reload_requested || s.rules_time != rules_time))
 	{
 		std::vector<draw_rule> rules; std::string error;
-		if (read_rules(rules_path, rules, error)) { s.rules = std::move(rules); s.rules_loaded = true; rule_times[rules_path] = rules_time; changed = true; }
+		if (read_rules(rules_path, rules, error)) { s.rules = std::move(rules); s.rules_loaded = true; s.rules_time = rules_time; changed = true; }
 		else report(s, error + "; previous draw rules remain active");
 	}
 	if (changed) ++s.generation;
@@ -2261,7 +2261,7 @@ static void compile_editor(device_state &s, const shader_info &shader)
 		target[stage.size() + 2] != '_' || target.back() < '0' || target.back() > '9' || !s.editor_entry[0])
 	{ s.editor_diagnostics = "Choose a target matching the original stage (for example ps_5_0 or ps_6_0) and an entry point."; return; }
 	std::vector<std::filesystem::path> directories;
-	for (const auto &path : shader_option_lines(s.editor_include_paths)) directories.push_back(std::filesystem::u8path(path));
+	if (!parse_include_dirs(s.editor_include_paths, directories, s.editor_diagnostics)) return;
 	std::vector<std::pair<std::string, std::string>> definitions;
 	if (!shader_definitions(s.editor_defines, definitions, s.editor_diagnostics)) return;
 	if (!save_editor(s)) { s.editor_diagnostics = s.status; return; }
@@ -2582,6 +2582,17 @@ static void show_profiler(effect_runtime *runtime, device_state &s)
 	ImGui::TextWrapped("Timing is off by default. Capture a frame after enabling it. Results arrive asynchronously without waiting for the GPU. Cached commands retain timestamps until the game records them again after you disable timing.");
 	if (s.gpu_timing && ImGui::Button("Capture timed frame")) { s.capture_next = true; s.live = false; }
 	ImGui::Text("Timestamp pages: %zu / %zu | Pending readbacks: %zu / %zu | Dropped: %llu", s.timing_pool.size(), max_timing_pages, s.timing_pending.size(), max_timing_submissions, static_cast<unsigned long long>(s.timing_dropped));
+	if (s.gpu_timing && !s.timed_frames.empty() && !s.frame.empty())
+		ImGui::TextDisabled("Showing frame %llu while %zu newer frame%s await GPU readback. Newer results appear automatically once their timestamps resolve.", static_cast<unsigned long long>(s.displayed_frame_index), s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s");
+	if (s.frame.empty())
+	{
+		switch (profiler_frame_hint_state(s.frame.empty(), s.displayed_frame_index, s.timed_frames.size()))
+		{
+		case profiler_frame_hint::never_captured: ImGui::TextWrapped("%s", s.recording_frame ? "Capturing the current frame. Its draws appear here once the frame completes." : "No frame captured yet. Enable GPU timing above to use Capture timed frame here, or record a plain frame from the Frame / pipeline tab (Capture next frame or Live capture)."); break;
+		case profiler_frame_hint::awaiting_readback: ImGui::TextWrapped("GPU timing is on and %zu captured frame%s await their first timestamp readback. Results appear automatically once the GPU reports them.", s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s"); break;
+		case profiler_frame_hint::captured_empty: ImGui::TextWrapped("Frame %llu was captured with no recorded actions. Capture again while the scene is running to record draws.", static_cast<unsigned long long>(s.displayed_frame_index)); break;
+		default: break; }
+	}
 	struct shader_cost { uint64_t shader = 0; uint32_t count = 0; double total = 0, maximum = 0; };
 	std::map<uint64_t, shader_cost> costs;
 	for (const auto &record : s.frame) if (gpu_ms(record) >= 0)
@@ -2661,13 +2672,22 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 	ImGui::SameLine(); if (ImGui::Button("Export frame")) export_frame(s);
 	ImGui::Checkbox("Sort expensive draws first", &s.expensive_first);
 	ImGui::SameLine(); ImGui::Checkbox("Capture resource bindings", &s.detailed_resources);
-	ImGui::Text("Frame %llu: %zu actions%s", static_cast<unsigned long long>(s.displayed_frame_index), s.frame.size(), s.frame.size() == max_draws ? " (capture limit reached)" : "");
-	if (!s.timed_frames.empty()) ImGui::TextDisabled("Waiting for GPU measurements: %zu newer frames", s.timed_frames.size());
+	if (!s.frame.empty()) ImGui::Text("Frame %llu: %zu actions%s", static_cast<unsigned long long>(s.displayed_frame_index), s.frame.size(), s.frame.size() == max_draws ? " (capture limit reached)" : "");
+	if (!s.timed_frames.empty()) ImGui::TextDisabled("Waiting for GPU measurements: %zu newer frame%s", s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s");
+	if (s.frame.empty())
+	{
+		switch (profiler_frame_hint_state(s.frame.empty(), s.displayed_frame_index, s.timed_frames.size()))
+		{
+		case profiler_frame_hint::never_captured: ImGui::TextWrapped("%s", s.recording_frame ? "Capturing the current frame. Its draws appear here once the frame completes." : "No frame captured yet. Press Capture next frame, or enable Live capture, to record one."); break;
+		case profiler_frame_hint::awaiting_readback: ImGui::TextWrapped("GPU timing is on and %zu captured frame%s await their first timestamp readback. Results appear automatically once the GPU reports them.", s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s"); break;
+		case profiler_frame_hint::captured_empty: ImGui::TextWrapped("Frame %llu was captured with no recorded actions. Capture again while the scene is running to record draws.", static_cast<unsigned long long>(s.displayed_frame_index)); break;
+		default: break; }
+	}
 	const float list_width = std::max(240.0f, ImGui::GetContentRegionAvail().x * 0.44f);
 	ImGui::BeginChild("events", ImVec2(list_width, 450), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
 	if (ImGui::BeginTable("draw_list", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY))
 	{
-		ImGui::TableSetupColumn("Event"); ImGui::TableSetupColumn("Action"); ImGui::TableSetupColumn("Count / X"); ImGui::TableSetupColumn("Instances / Y"); ImGui::TableSetupColumn("GPU ms"); ImGui::TableSetupColumn("Output"); ImGui::TableSetupColumn("Region"); ImGui::TableHeadersRow();
+		ImGui::TableSetupColumn("Event"); ImGui::TableSetupColumn("Action"); ImGui::TableSetupColumn("Count"); ImGui::TableSetupColumn("Instances"); ImGui::TableSetupColumn("GPU ms"); ImGui::TableSetupColumn("Output"); ImGui::TableSetupColumn("Region"); ImGui::TableHeadersRow();
 		std::vector<size_t> order; for (size_t i = 0; i < s.frame.size(); ++i) order.push_back(i);
 		if (s.expensive_first) std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return gpu_ms(s.frame[a]) > gpu_ms(s.frame[b]); });
 		for (size_t i : order)
@@ -2826,9 +2846,9 @@ static void draw_panel(effect_runtime *runtime)
 					ImGui::TextWrapped("Edit replacement HLSL, then Compile and apply. SM4/5 uses D3DCompiler; SM6 uses the bundled DXC compiler and validator.");
 					if (ImGui::CollapsingHeader("Compiler settings: includes and defines"))
 					{
-						ImGui::TextWrapped("Include directories: one path per line. Imported source adds its original directory; add the game/source root for includes relative to that root.");
+						ImGui::TextWrapped("Include directories: one path per line (up to 32). Imported source adds its original directory; add the game/source root for includes relative to that root.");
 						if (ImGui::InputTextMultiline("##include_dirs", s.editor_include_paths, sizeof(s.editor_include_paths), ImVec2(-1, 60))) s.editor_settings_dirty = true;
-						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line. Use the original shader variant's defines when available. Settings are saved with the source.");
+						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line (up to 256). Use the original shader variant's defines when available. Settings are saved with the source.");
 						if (ImGui::InputTextMultiline("##defines", s.editor_defines, sizeof(s.editor_defines), ImVec2(-1, 60))) s.editor_settings_dirty = true;
 					}
 					if (shader->second.stage == pipeline_subobject_type::pixel_shader)

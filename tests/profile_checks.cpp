@@ -42,6 +42,10 @@ int main()
 		for (const auto *invalid : {"", "0x", "-1", "123junk", "18446744073709551616"}) expect(!number(invalid, value), "Invalid number accepted");
 		expect(hex_id(1) == "0000000000000001", "Shader ID formatting");
 		expect(hash_bytes("hello", 5) == 0xA430D84680AABD0Bull, "Stable FNV shader hash");
+		expect(profiler_frame_hint_state(false, 0, 0) == profiler_frame_hint::none && profiler_frame_hint_state(false, 7, 2) == profiler_frame_hint::none, "Non-empty frame shows no hint");
+		expect(profiler_frame_hint_state(true, 0, 0) == profiler_frame_hint::never_captured, "Empty frame before any capture is never captured");
+		expect(profiler_frame_hint_state(true, 0, 1) == profiler_frame_hint::awaiting_readback && profiler_frame_hint_state(true, 0, 4) == profiler_frame_hint::awaiting_readback, "Queued frames before the first readback await it");
+		expect(profiler_frame_hint_state(true, 3, 0) == profiler_frame_hint::captured_empty && profiler_frame_hint_state(true, 3, 2) == profiler_frame_hint::captured_empty, "Promoted empty frame reports captured empty");
 		const auto rules_path = temporary.path / "rules.ini";
 		put(rules_path, "[clouds]\nkind=indexed\nshader=0123456789ABCDEF\ncount=0\naction=skip\n[change]\nkind=draw\naction=modify\nreplace_instances=0\n");
 		std::vector<draw_rule> rules; std::string error;
