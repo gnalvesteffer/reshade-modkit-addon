@@ -21,7 +21,7 @@ Mirrors a small software team: several reviewers, each focused on one responsibi
 1. Get the diff: `gh pr diff <number>` (or `git diff origin/main...<branch>` locally).
 2. Dispatch one subagent per role in parallel. Each prompt must contain: the PR number and URL, the full diff, the branch name, the repo worktree path to read surrounding context from, a pointer to this repo's `.agents/skills/<role-skill>/SKILL.md`, and the instruction to end with a verdict of `APPROVE`, `REQUEST_CHANGES`, or `COMMENT` plus a numbered findings list (file:line, severity, concrete fix).
 3. Consolidate: dedupe overlapping findings, rank by severity (blocker > major > minor > nit).
-4. Blockers/majors go back to the implementing worker as a fix list; re-run review after fixes. Comments/nits are optional.
+4. Blockers/majors go back to the implementing worker as a fix list; re-run review after fixes. Comments/nits are optional. Dispatch ONE consolidated fix worker per PR covering all actionable findings — never overlapping fix workers on the same worktree (concurrent `git add`/index writes corrupt each other). If you dispatched an early narrow fixer before all verdicts landed, stop it (`delegate_task action='stop'`) once the superset fixer starts.
 5. Only when all roles report `APPROVE` (or remaining items are accepted nits) and CI is green, merge with `gh pr merge <number> --squash`.
 
 ## Ground rules for reviewers
