@@ -2261,7 +2261,7 @@ static void compile_editor(device_state &s, const shader_info &shader)
 		target[stage.size() + 2] != '_' || target.back() < '0' || target.back() > '9' || !s.editor_entry[0])
 	{ s.editor_diagnostics = "Choose a target matching the original stage (for example ps_5_0 or ps_6_0) and an entry point."; return; }
 	std::vector<std::filesystem::path> directories;
-	for (const auto &path : shader_option_lines(s.editor_include_paths)) directories.push_back(std::filesystem::u8path(path));
+	if (!parse_include_dirs(s.editor_include_paths, directories, s.editor_diagnostics)) return;
 	std::vector<std::pair<std::string, std::string>> definitions;
 	if (!shader_definitions(s.editor_defines, definitions, s.editor_diagnostics)) return;
 	if (!save_editor(s)) { s.editor_diagnostics = s.status; return; }
@@ -2804,9 +2804,9 @@ static void draw_panel(effect_runtime *runtime)
 					ImGui::TextWrapped("Edit replacement HLSL, then Compile and apply. SM4/5 uses D3DCompiler; SM6 uses the bundled DXC compiler and validator.");
 					if (ImGui::CollapsingHeader("Compiler settings: includes and defines"))
 					{
-						ImGui::TextWrapped("Include directories: one path per line. Imported source adds its original directory; add the game/source root for includes relative to that root.");
+						ImGui::TextWrapped("Include directories: one path per line (up to 32). Imported source adds its original directory; add the game/source root for includes relative to that root.");
 						if (ImGui::InputTextMultiline("##include_dirs", s.editor_include_paths, sizeof(s.editor_include_paths), ImVec2(-1, 60))) s.editor_settings_dirty = true;
-						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line. Use the original shader variant's defines when available. Settings are saved with the source.");
+						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line (up to 256). Use the original shader variant's defines when available. Settings are saved with the source.");
 						if (ImGui::InputTextMultiline("##defines", s.editor_defines, sizeof(s.editor_defines), ImVec2(-1, 60))) s.editor_settings_dirty = true;
 					}
 					if (shader->second.stage == pipeline_subobject_type::pixel_shader)
