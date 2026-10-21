@@ -2804,9 +2804,9 @@ static void draw_panel(effect_runtime *runtime)
 					ImGui::TextWrapped("Edit replacement HLSL, then Compile and apply. SM4/5 uses D3DCompiler; SM6 uses the bundled DXC compiler and validator.");
 					if (ImGui::CollapsingHeader("Compiler settings: includes and defines"))
 					{
-						ImGui::TextWrapped("Include directories: one path per line. Imported source adds its original directory; add the game/source root for includes relative to that root.");
+						ImGui::TextWrapped("Include directories: one path per line (up to 32). Imported source adds its original directory; add the game/source root for includes relative to that root.");
 						if (ImGui::InputTextMultiline("##include_dirs", s.editor_include_paths, sizeof(s.editor_include_paths), ImVec2(-1, 60))) s.editor_settings_dirty = true;
-						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line. Use the original shader variant's defines when available. Settings are saved with the source.");
+						ImGui::TextWrapped("Defines: one NAME or NAME=VALUE per line (up to 256). Use the original shader variant's defines when available. Settings are saved with the source.");
 						if (ImGui::InputTextMultiline("##defines", s.editor_defines, sizeof(s.editor_defines), ImVec2(-1, 60))) s.editor_settings_dirty = true;
 					}
 					if (shader->second.stage == pipeline_subobject_type::pixel_shader)

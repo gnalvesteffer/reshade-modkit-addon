@@ -48,6 +48,7 @@ inline std::vector<std::string> shader_option_lines(const std::string &text)
 }
 inline bool shader_definitions(const std::string &text, std::vector<std::pair<std::string, std::string>> &definitions, std::string &error)
 {
+	definitions.clear();
 	for (const auto &line : shader_option_lines(text))
 	{
 		if (line.size() > 4096) { error = "Defines need one NAME or NAME=VALUE per line; each line must be at most 4096 characters."; return false; }
@@ -55,17 +56,18 @@ inline bool shader_definitions(const std::string &text, std::vector<std::pair<st
 		if (name.empty() || (!std::isalpha(static_cast<unsigned char>(name[0])) && name[0] != '_') ||
 			std::any_of(name.begin(), name.end(), [](unsigned char c) { return !std::isalnum(c) && c != '_'; }))
 		{ error = "Defines need one NAME or NAME=VALUE per line; macro names must be identifiers."; return false; }
-		if (definitions.size() == 256) { error = "At most 256 defines are allowed per shader."; return false; }
+		if (definitions.size() == 256) { error = "At most 256 defines are allowed per shader. Remove the extra define lines, then Compile and apply again."; return false; }
 		definitions.emplace_back(name, equal == std::string::npos ? "1" : line.substr(equal + 1));
 	}
 	return true;
 }
 inline bool parse_include_dirs(const std::string &text, std::vector<std::filesystem::path> &directories, std::string &error)
 {
+	directories.clear();
 	for (const auto &line : shader_option_lines(text)) // Empty lines are skipped by shader_option_lines.
 	{
 		if (line.size() > 4096) { error = "Include paths need one directory per line; each line must be at most 4096 characters."; return false; }
-		if (directories.size() == 32) { error = "At most 32 include directories are allowed per shader."; return false; }
+		if (directories.size() == 32) { error = "At most 32 include directories are allowed per shader. Remove an unused directory line, then Compile and apply again."; return false; }
 		directories.push_back(std::filesystem::u8path(line));
 	}
 	return true;

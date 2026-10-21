@@ -104,6 +104,7 @@ Output main(Input input) {
 		for (int i = 0; i < 256; ++i) define_lines += "D" + std::to_string(i) + "=1\n";
 		expect(shader_definitions(define_lines, capped, diagnostic) && capped.size() == 256, "Exactly 256 defines should parse");
 		define_lines += "D256=1\n";
+		capped.clear();
 		expect(!shader_definitions(define_lines, capped, diagnostic) && !diagnostic.empty(), "More than 256 defines accepted");
 		std::vector<std::filesystem::path> include_dirs; diagnostic.clear();
 		const auto parsed_dirs = parse_include_dirs("C:\\Shaders\\include\r\n" + (directory.path / "include folder").u8string() + "\n", include_dirs, diagnostic);
@@ -112,6 +113,7 @@ Output main(Input input) {
 		for (int i = 0; i < 32; ++i) dir_lines += "dir" + std::to_string(i) + "\n";
 		expect(parse_include_dirs(dir_lines, capped_dirs, diagnostic) && capped_dirs.size() == 32, "Exactly 32 include directories should parse");
 		dir_lines += "dir32\n";
+		capped_dirs.clear();
 		expect(!parse_include_dirs(dir_lines, capped_dirs, diagnostic) && !diagnostic.empty(), "More than 32 include directories accepted");
 		diagnostic.clear(); std::vector<std::filesystem::path> long_dirs;
 		expect(!parse_include_dirs(std::string(4097, 'x'), long_dirs, diagnostic) && !diagnostic.empty(), "Overlong include line accepted");
