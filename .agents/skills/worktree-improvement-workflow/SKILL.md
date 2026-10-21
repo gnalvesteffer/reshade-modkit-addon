@@ -44,3 +44,29 @@ gh pr create --base main --head <branch> --title "<imperative summary>" --body-f
 ```
 
 PR body: what changed, why, which checks ran locally, and anything the reviewer must verify on Windows. Do not merge your own PR — role-based review (see `pr-review`) decides when it is ready.
+
+## Closing out a multi-PR campaign (integration gate)
+
+When several slices are reviewed and approved but all touch overlapping files (e.g.
+`modkit.cpp`, shared headers, the same test file), do NOT merge them to main one by
+one blind — prove the combined state first:
+
+1. Build an integration branch from `origin/main`: merge each slice in a sensible
+   order (`git merge --no-ff <branch>`). Expect conflicts where two PRs appended to
+   the same region (typical: test blocks before a file's final line) — resolve by
+   keeping **both** sides, in a deliberate order.
+2. Verify the combined tree locally (portable checks + full MinGW cross-build), push
+   the branch, and open it as a **draft PR to main** so CI runs the Windows `.exe`
+   suites on the merged state. (Plain branch pushes do not trigger this repo's CI —
+   only `push: branches [main]`, tags, and `pull_request: branches [main]`.)
+3. Once the draft is green, merge the individual PRs to main in the same order. A PR
+   whose shared-file conflict was already resolved on the integration branch will hit
+   it again when merging against a main that now contains the earlier PR — resolve
+   identically (rebase the branch onto `origin/main`, fix, push, re-merge).
+4. Close the draft without merging; delete all slice branches and worktrees; record
+   the outcome in `IMPROVEMENTS.md`.
+
+GitHub's stacked-PR feature is the alternative when slices are genuinely dependent
+(each layer needs the one below to build) or the campaign keeps growing over time; for
+a one-shot batch of independent, already-reviewed slices the integration gate above is
+simpler and avoids re-basing every branch.
