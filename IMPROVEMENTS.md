@@ -88,8 +88,12 @@ bcd52b4; all worktrees removed.
 - **[docs] Document failure-time out-param state** of shader_definitions / parse_include_dirs
   (clear-on-entry leaves a partial fill on failure; all callers check the return first).
   (PR #1 code-correctness nit.)
+- **[test] Extract refcount/budget arithmetic into a header-testable unit.** The
+  descriptor cap guard, `descriptor_limit_reported` state machine and shader reference
+  counting live inside modkit.cpp, so the header-only check suites cannot reach them;
+  no unit test covers them yet. (PR #6 code-correctness.)
 
-### Slice E — branch `harden/memory-lifetime` (PR #6)
+### Slice E — MERGED to main as `965da55` (branch `harden/memory-lifetime`, PR #6)
 - **[defect] Dead shader bytecode is never freed from the capture budget.**
   `on_init_pipeline` adds each new shader's code size to `capture_bytes`, but
   `pipeline_snapshot::bytes` already includes it, and `on_destroy_pipeline` only
