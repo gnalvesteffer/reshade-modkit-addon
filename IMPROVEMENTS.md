@@ -10,7 +10,7 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 
 ## Assigned to worktrees
 
-### Slice A — branch `improve/shader-editor-qol` (PR #2, CI green)
+### Slice A — branch `improve/shader-editor-qol` (PR #2, fixes applied per review)
 - **[qol] Open mod directory from the UI.** The Session tab prints the mod root path
   as text, but there is no button to reveal it in Explorer. Add an "Open mod folder"
   button next to the path (reuse `open_mod_path`). *modkit.cpp `draw_panel`.*
@@ -35,20 +35,23 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 - **[test] Add regression tests** for the new caps and validation in
   `tests/shader_edit_checks.cpp` (and `profile_checks.cpp` where relevant).
 
-### Slice C — branch `improve/profiler-frame-ux` (PR #3)
+### Slice C — branch `improve/profiler-frame-ux` (PR #3, fixes in progress)
 - **[ux] Profiler/frame UX.** Improve the Profiler and Frame/pipeline tabs: clearer
   empty-state guidance, consistent column/label naming, and a visible indicator when
   the displayed frame is stale (pre-timing readback). *modkit.cpp `show_profiler`,
   `show_draws`.*
 - **[docs] Document profiler/capture behavior** in MODKIT.md.
 
+### Slice D — branch `harden/poll-files-state` (worktree ready)
+- **[defect/robustness] Unbounded function-local static in `poll_files`.** The
+  `static std::map<std::filesystem::path, std::filesystem::file_time_type> rule_times;`
+  at modkit.cpp ~1272 grows per distinct rules.ini path and is never freed on device
+  destroy. Move the last-seen timestamp into `device_state` (freed with the device)
+  and drop the static. *modkit.cpp `poll_files`, `device_state`.*
+- **[qol] Cosmetic indentation in `poll_files`.** Lines ~1267, 1269, 1280 are unindented
+  vs their block (likely a merge artifact). Re-indent to match the surrounding body.
+
 ## Reviewed / deferred (noted, not yet scheduled)
-- **[qol] Cosmetic indentation** in `poll_files` (`s.files.swap(latest);` and
-  `s.reload_requested = false;`) is unindented vs. the block — likely a merge artifact.
-  Low value; fold into whichever slice touches nearby code if convenient.
-- **[qol] Function-local static `rule_times` map** in `poll_files` grows per distinct
-  rules.ini path and is never freed on device destroy. Bounded in practice (few
-  devices); move into `device_state` if a slice already edits that area.
 - **[feature] In-editor syntax highlighting / line numbers.** The editor is an ImGui
   `InputTextMultiline`; a lightweight embedded text editor would be a large change and
   is out of scope for the current pass.
