@@ -88,3 +88,25 @@ bcd52b4; all worktrees removed.
 - **[docs] Document failure-time out-param state** of shader_definitions / parse_include_dirs
   (clear-on-entry leaves a partial fill on failure; all callers check the return first).
   (PR #1 code-correctness nit.)
+
+### Slice E — branch `harden/memory-lifetime` (PR #6)
+- **[defect] Dead shader bytecode is never freed from the capture budget.**
+  `on_init_pipeline` adds each new shader's code size to `capture_bytes`, but
+  `pipeline_snapshot::bytes` already includes it, and `on_destroy_pipeline` only
+  subtracts the snapshot portion — so with pipeline churn `capture_bytes` ratchets up
+  through dead shader code until the 256 MiB limit blocks every new pipeline. Track a
+  per-shader reference count and release the shader's code from the budget when its
+  last live pipeline goes away (including the OpenGL handle-reuse path, which erases
+  an old snapshot without a destroy notification). *modkit.cpp `on_init_pipeline`,
+  `on_destroy_pipeline`.*
+- **[defect] Dropped GPU timing readback pages are never reclaimed.** Pages added to
+  `untracked_timing_pages` when a readback batch is dropped keep a refcount of exactly
+  2 (pool + untracked list) forever, so the pool scan can never reuse them and
+  `native_timing_enabled` stays armed. Reclaim a page in the per-frame drain once its
+  commands have released their slots. *modkit.cpp `on_present`.*
+- **[defect] Unbounded descriptor tracking map.** `s->descriptors` grows with every
+  distinct (heap handle, offset) slot observed and the ReShade API exposes no
+  heap-destroy event, so entries for destroyed heaps linger forever in long sessions.
+  Cap at 524288 entries; new keys beyond the cap keep their original values while
+  already-tracked entries still update in place. *modkit.cpp `on_update_descriptors`.*
+- **[docs] Document the descriptor cap and the reclamation behavior** in MODKIT.md.

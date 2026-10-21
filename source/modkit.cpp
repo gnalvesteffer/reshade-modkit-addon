@@ -37,6 +37,7 @@ constexpr size_t max_capture_bytes = 256 * 1024 * 1024;
 constexpr size_t max_replacement_bytes = 512 * 1024 * 1024;
 constexpr size_t max_draws = 8192, max_tables = 4096, max_pipelines = 1024;
 constexpr size_t max_views = 16384;
+constexpr size_t max_descriptors = 524288;
 static std::recursive_mutex mutex;
 static thread_local bool internal_call = false;
 struct internal_scope
@@ -194,6 +195,7 @@ struct device_state
 	std::filesystem::path root;
 	std::unordered_map<uint64_t, pipeline_info> pipelines;
 	std::map<uint64_t, shader_info> shaders;
+	std::map<uint64_t, uint32_t> shader_refs;
 	shader_label_map shader_labels;
 	bool labels_dirty = false;
 	effect_point early_effects;
@@ -226,6 +228,7 @@ struct device_state
 	size_t capture_bytes = 0, replacement_bytes = 0;
 	size_t action_bytes = 0;
 	uint64_t generation = 1, serial = 0, descriptor_version = 0, frame_index = 0;
+	bool descriptor_limit_reported = false;
 	uint64_t pipeline_epoch = 1;
 	uint64_t total_draws = 0, modified_draws = 0, skipped_draws = 0;
 	bool enabled = true, live = false, capture_next = false, recording_frame = false;
@@ -433,6 +436,18 @@ static void update_timing_enabled()
 		if (s.timing_hooked) for (const auto &page : s.timing_pool) armed |= page.use_count() > 1;
 	}
 	native_timing_enabled = armed;
+}
+// A shader's code stays in the capture budget while any live pipeline uses it.
+static void release_pipeline_shaders(device_state &s, const pipeline_snapshot &snapshot)
+{
+	for (const auto &obj : snapshot.objects) for (const auto &shader : obj.shaders)
+	{
+		const auto ref = s.shader_refs.find(shader.hash);
+		if (ref == s.shader_refs.end() || --ref->second > 0) continue;
+		s.shader_refs.erase(ref);
+		if (auto entry = s.shaders.find(shader.hash); entry != s.shaders.end())
+		{ if (s.selected_shader == shader.hash) s.selected_shader = 0; s.capture_bytes -= entry->second.code.size(); s.shaders.erase(entry); }
+	}
 }
 static void finish_comparison(device_state &s, const std::string &message)
 {
@@ -874,7 +889,7 @@ static void on_init_pipeline(device *dev, pipeline_layout layout, uint32_t count
 	++s->pipeline_epoch;
 	// OpenGL relinks can reuse a program handle without a destroy notification.
 	if (auto old = s->pipelines.find(pipe.handle); old != s->pipelines.end())
-	{ s->capture_bytes -= old->second.snapshot.bytes; s->pipelines.erase(old); }
+	{ s->capture_bytes -= old->second.snapshot.bytes; release_pipeline_shaders(*s, old->second.snapshot); s->pipelines.erase(old); }
 	if (s->capture_bytes >= max_capture_bytes) return;
 	auto snapshot = capture_pipeline(dev->get_api(), layout, count, objects);
 	if (dev->get_api() == device_api::opengl)
@@ -899,7 +914,9 @@ static void on_init_pipeline(device *dev, pipeline_layout layout, uint32_t count
 		{
 			s->shaders.emplace(shader.hash, shader_info{shader.hash, obj.type, shader.extension, shader.entry, shader.code});
 			s->capture_bytes += shader.code.size();
+			s->shader_refs[shader.hash] = 1;
 		}
+		else if (s->shaders.count(shader.hash)) ++s->shader_refs[shader.hash];
 	}
 	s->capture_bytes += snapshot.bytes;
 	s->pipelines[pipe.handle].snapshot = std::move(snapshot);
@@ -909,7 +926,7 @@ static void on_destroy_pipeline(device *dev, pipeline pipe)
 	if (internal_call) return;
 	std::lock_guard<std::recursive_mutex> lock(mutex);
 	if (auto s = find(dev)) if (auto it = s->pipelines.find(pipe.handle); it != s->pipelines.end())
-	{ s->capture_bytes -= it->second.snapshot.bytes; s->pipelines.erase(it); ++s->pipeline_epoch; }
+	{ s->capture_bytes -= it->second.snapshot.bytes; release_pipeline_shaders(*s, it->second.snapshot); s->pipelines.erase(it); ++s->pipeline_epoch; }
 }
 static void on_init_resource(device *dev, const resource_desc &desc, const subresource_data *data, resource_usage, resource res)
 {
@@ -1063,6 +1080,13 @@ static bool on_update_descriptors(device *dev, uint32_t count, const descriptor_
 		{
 			auto value = read_descriptor(u.type, u.descriptors, j);
 			const auto key = std::make_pair(heap.handle, offset + j);
+			if (!s->descriptors.count(key) && s->descriptors.size() >= max_descriptors)
+			{
+				// Report once per saturation episode; the flag resets when tracked descriptors drop below half the cap.
+				if (!s->descriptor_limit_reported) { s->descriptor_limit_reported = true; report(*s, "Descriptor tracking limit reached; untracked descriptors keep their original values. Restart the game to reclaim descriptor tracking slots."); }
+				continue;
+			}
+			else if (s->descriptor_limit_reported && s->descriptors.size() < max_descriptors / 2) s->descriptor_limit_reported = false;
 			const auto previous = s->descriptors.find(key);
 			value.version = previous != s->descriptors.end() && descriptors_equal(value, previous->second) ? previous->second.version : ++s->descriptor_version;
 			s->descriptors[key] = value;
@@ -1087,6 +1111,7 @@ static bool on_copy_descriptors(device *dev, uint32_t count, const descriptor_ta
 			if (saved[j])
 			{
 				const auto key = std::make_pair(dst.handle, to + j);
+				if (!s->descriptors.count(key) && s->descriptors.size() >= max_descriptors) { s->descriptors.erase({dst.handle, to + j}); continue; }
 				const auto previous = s->descriptors.find(key);
 				saved[j]->version = previous != s->descriptors.end() && descriptors_equal(*saved[j], previous->second) ? previous->second.version : ++s->descriptor_version;
 				s->descriptors[key] = *saved[j];
@@ -1911,6 +1936,9 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 	advance_comparison(*s, now);
 	collect_texture_snapshots(*s);
 	s->timing_pending.erase(std::remove_if(s->timing_pending.begin(), s->timing_pending.end(), [](auto &batch) { return collect_timing_readback(*batch); }), s->timing_pending.end());
+	// Dropped readback pages return to the pool once their commands release the slots.
+	// use_count() == 2 encodes exactly two holders: timing_pool and this list; any additional holder (a command query_page slot, a pending batch's retained pages) keeps the slots live.
+	s->untracked_timing_pages.erase(std::remove_if(s->untracked_timing_pages.begin(), s->untracked_timing_pages.end(), [](const auto &page) { return page.use_count() == 2; }), s->untracked_timing_pages.end());
 	// Live capture displays the newest completed measurements, not the newest
 	// submitted frame whose timestamps would still be pending every time.
 	for (auto it = s->timed_frames.begin(); it != s->timed_frames.end();)
@@ -2790,6 +2818,7 @@ static void draw_panel(effect_runtime *runtime)
 			}
 			ImGui::EndChild(); ImGui::SameLine(); ImGui::BeginChild("shader_detail", ImVec2(0, 400), ImGuiChildFlags_Borders);
 			if (auto it = s.shaders.find(s.selected_shader); it != s.shaders.end()) show_shader(s, it->second);
+			else ImGui::TextDisabled("No shader selected.");
 			ImGui::EndChild(); ImGui::EndTabItem();
 		}
 		for (const bool textures : {true, false}) if (ImGui::BeginTabItem(textures ? "Textures" : "Buffers"))
