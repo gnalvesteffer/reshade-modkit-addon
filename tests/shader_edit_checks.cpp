@@ -117,6 +117,13 @@ Output main(Input input) {
 		expect(!parse_include_dirs(dir_lines, capped_dirs, diagnostic) && !diagnostic.empty(), "More than 32 include directories accepted");
 		diagnostic.clear(); std::vector<std::filesystem::path> long_dirs;
 		expect(!parse_include_dirs(std::string(4097, 'x'), long_dirs, diagnostic) && !diagnostic.empty(), "Overlong include line accepted");
+		std::string profile_error;
+		expect(!replacement_profile_ok(original_interface, dxil_interface, profile_error) && !profile_error.empty(), "Profile mismatch accepted (ps_5_0 vs ps_6_0)");
+		expect(replacement_profile_ok(original_interface, original_interface, profile_error), "Same profile rejected");
+		shader_interface same_profile_dxil = original_interface; same_profile_dxil.dxil = true;
+		expect(!replacement_profile_ok(original_interface, same_profile_dxil, profile_error) && !profile_error.empty(), "Cross-format import accepted (ps_5_0 DXBC vs ps_5_0 DXIL)");
+		shader_interface empty_original; expect(replacement_profile_ok(empty_original, dxil_interface, profile_error), "Empty original profile rejected");
+		shader_interface empty_replacement; expect(replacement_profile_ok(original_interface, empty_replacement, profile_error), "Empty replacement profile rejected");
 		std::cout << "Shader editor checks passed (DXBC and DXIL)\n"; return 0;
 	}
 	catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
