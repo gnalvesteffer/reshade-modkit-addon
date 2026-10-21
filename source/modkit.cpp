@@ -220,6 +220,7 @@ struct device_state
 	std::deque<std::pair<uint64_t, std::vector<draw_record>>> timed_frames;
 	uint64_t displayed_frame_index = 0;
 	std::vector<draw_rule> rules;
+	std::filesystem::file_time_type rules_time{};
 	std::unordered_set<uint64_t> suppressed_shaders, disabled_shaders;
 	std::map<std::filesystem::path, file_info> files;
 	size_t capture_bytes = 0, replacement_bytes = 0;
@@ -1269,11 +1270,10 @@ static void poll_files(device_state &s)
 	s.files.swap(latest);
 	const auto rules_path = s.root / "rules.ini";
 	const auto rules_time = std::filesystem::last_write_time(rules_path, ec);
-	static std::map<std::filesystem::path, std::filesystem::file_time_type> rule_times;
-	if (!ec && (!s.rules_loaded || s.reload_requested || rule_times[rules_path] != rules_time))
+	if (!ec && (!s.rules_loaded || s.reload_requested || s.rules_time != rules_time))
 	{
 		std::vector<draw_rule> rules; std::string error;
-		if (read_rules(rules_path, rules, error)) { s.rules = std::move(rules); s.rules_loaded = true; rule_times[rules_path] = rules_time; changed = true; }
+		if (read_rules(rules_path, rules, error)) { s.rules = std::move(rules); s.rules_loaded = true; s.rules_time = rules_time; changed = true; }
 		else report(s, error + "; previous draw rules remain active");
 	}
 	if (changed) ++s.generation;
