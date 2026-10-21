@@ -228,6 +228,7 @@ struct device_state
 	size_t capture_bytes = 0, replacement_bytes = 0;
 	size_t action_bytes = 0;
 	uint64_t generation = 1, serial = 0, descriptor_version = 0, frame_index = 0;
+	bool descriptor_limit_reported = false;
 	uint64_t pipeline_epoch = 1;
 	uint64_t total_draws = 0, modified_draws = 0, skipped_draws = 0;
 	bool enabled = true, live = false, capture_next = false, recording_frame = false;
@@ -445,7 +446,7 @@ static void release_pipeline_shaders(device_state &s, const pipeline_snapshot &s
 		if (ref == s.shader_refs.end() || --ref->second > 0) continue;
 		s.shader_refs.erase(ref);
 		if (auto entry = s.shaders.find(shader.hash); entry != s.shaders.end())
-		{ s.capture_bytes -= entry->second.code.size(); s.shaders.erase(entry); }
+		{ if (s.selected_shader == shader.hash) s.selected_shader = 0; s.capture_bytes -= entry->second.code.size(); s.shaders.erase(entry); }
 	}
 }
 static void finish_comparison(device_state &s, const std::string &message)
@@ -1079,7 +1080,13 @@ static bool on_update_descriptors(device *dev, uint32_t count, const descriptor_
 		{
 			auto value = read_descriptor(u.type, u.descriptors, j);
 			const auto key = std::make_pair(heap.handle, offset + j);
-			if (!s->descriptors.count(key) && s->descriptors.size() >= max_descriptors) { report(*s, "Descriptor tracking limit reached; untracked descriptors keep their original values. Restart the game to reclaim."); continue; }
+			if (!s->descriptors.count(key) && s->descriptors.size() >= max_descriptors)
+			{
+				// Report once per saturation episode; the flag resets when tracked descriptors drop below half the cap.
+				if (!s->descriptor_limit_reported) { s->descriptor_limit_reported = true; report(*s, "Descriptor tracking limit reached; untracked descriptors keep their original values. Restart the game to reclaim descriptor tracking slots."); }
+				continue;
+			}
+			else if (s->descriptor_limit_reported && s->descriptors.size() < max_descriptors / 2) s->descriptor_limit_reported = false;
 			const auto previous = s->descriptors.find(key);
 			value.version = previous != s->descriptors.end() && descriptors_equal(value, previous->second) ? previous->second.version : ++s->descriptor_version;
 			s->descriptors[key] = value;
@@ -1104,6 +1111,7 @@ static bool on_copy_descriptors(device *dev, uint32_t count, const descriptor_ta
 			if (saved[j])
 			{
 				const auto key = std::make_pair(dst.handle, to + j);
+				if (!s->descriptors.count(key) && s->descriptors.size() >= max_descriptors) { s->descriptors.erase({dst.handle, to + j}); continue; }
 				const auto previous = s->descriptors.find(key);
 				saved[j]->version = previous != s->descriptors.end() && descriptors_equal(*saved[j], previous->second) ? previous->second.version : ++s->descriptor_version;
 				s->descriptors[key] = *saved[j];
@@ -1929,6 +1937,7 @@ static void on_present(command_queue *queue, swapchain *, const rect *, const re
 	collect_texture_snapshots(*s);
 	s->timing_pending.erase(std::remove_if(s->timing_pending.begin(), s->timing_pending.end(), [](auto &batch) { return collect_timing_readback(*batch); }), s->timing_pending.end());
 	// Dropped readback pages return to the pool once their commands release the slots.
+	// use_count() == 2 encodes exactly two holders: timing_pool and this list; any additional holder (a command query_page slot, a pending batch's retained pages) keeps the slots live.
 	s->untracked_timing_pages.erase(std::remove_if(s->untracked_timing_pages.begin(), s->untracked_timing_pages.end(), [](const auto &page) { return page.use_count() == 2; }), s->untracked_timing_pages.end());
 	// Live capture displays the newest completed measurements, not the newest
 	// submitted frame whose timestamps would still be pending every time.
@@ -2809,6 +2818,7 @@ static void draw_panel(effect_runtime *runtime)
 			}
 			ImGui::EndChild(); ImGui::SameLine(); ImGui::BeginChild("shader_detail", ImVec2(0, 400), ImGuiChildFlags_Borders);
 			if (auto it = s.shaders.find(s.selected_shader); it != s.shaders.end()) show_shader(s, it->second);
+			else ImGui::TextDisabled("No shader selected.");
 			ImGui::EndChild(); ImGui::EndTabItem();
 		}
 		for (const bool textures : {true, false}) if (ImGui::BeginTabItem(textures ? "Textures" : "Buffers"))
