@@ -2581,7 +2581,15 @@ static void show_profiler(effect_runtime *runtime, device_state &s)
 	ImGui::Text("Timestamp pages: %zu / %zu | Pending readbacks: %zu / %zu | Dropped: %llu", s.timing_pool.size(), max_timing_pages, s.timing_pending.size(), max_timing_submissions, static_cast<unsigned long long>(s.timing_dropped));
 	if (s.gpu_timing && !s.timed_frames.empty() && !s.frame.empty())
 		ImGui::TextDisabled("Showing frame %llu while %zu newer frame%s await GPU readback. Newer results appear automatically once their timestamps resolve.", static_cast<unsigned long long>(s.displayed_frame_index), s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s");
-	if (s.frame.empty()) ImGui::TextWrapped("%s", s.recording_frame ? "Capturing the current frame. Its draws appear here once the frame completes." : "No frame captured yet. Enable GPU timing, then press Capture timed frame (or use Frame / pipeline) to record one.");
+	if (s.frame.empty())
+	{
+		switch (profiler_frame_hint_state(s.frame.empty(), s.displayed_frame_index, s.timed_frames.size()))
+		{
+		case profiler_frame_hint::never_captured: ImGui::TextWrapped("%s", s.recording_frame ? "Capturing the current frame. Its draws appear here once the frame completes." : "No frame captured yet. Enable GPU timing above to use Capture timed frame here, or record a plain frame from the Frame / pipeline tab (Capture next frame or Live capture)."); break;
+		case profiler_frame_hint::awaiting_readback: ImGui::TextWrapped("GPU timing is on and %zu captured frame%s await their first timestamp readback. Results appear automatically once the GPU reports them.", s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s"); break;
+		case profiler_frame_hint::captured_empty: ImGui::TextWrapped("Frame %llu was captured with no recorded actions. Capture again while the scene is running to record draws.", static_cast<unsigned long long>(s.displayed_frame_index)); break;
+		default: break; }
+	}
 	struct shader_cost { uint64_t shader = 0; uint32_t count = 0; double total = 0, maximum = 0; };
 	std::map<uint64_t, shader_cost> costs;
 	for (const auto &record : s.frame) if (gpu_ms(record) >= 0)
@@ -2661,9 +2669,17 @@ static void show_draws(effect_runtime *runtime, device_state &s)
 	ImGui::SameLine(); if (ImGui::Button("Export frame")) export_frame(s);
 	ImGui::Checkbox("Sort expensive draws first", &s.expensive_first);
 	ImGui::SameLine(); ImGui::Checkbox("Capture resource bindings", &s.detailed_resources);
-	ImGui::Text("Frame %llu: %zu actions%s", static_cast<unsigned long long>(s.displayed_frame_index), s.frame.size(), s.frame.size() == max_draws ? " (capture limit reached)" : "");
-	if (!s.timed_frames.empty()) ImGui::TextDisabled("Waiting for GPU measurements: %zu newer frames", s.timed_frames.size());
-	if (s.frame.empty()) ImGui::TextWrapped("%s", s.recording_frame ? "Capturing the current frame. Its draws appear here once the frame completes." : "No frame captured yet. Press Capture next frame, or enable Live capture, to record one.");
+	if (!s.frame.empty()) ImGui::Text("Frame %llu: %zu actions%s", static_cast<unsigned long long>(s.displayed_frame_index), s.frame.size(), s.frame.size() == max_draws ? " (capture limit reached)" : "");
+	if (!s.timed_frames.empty()) ImGui::TextDisabled("Waiting for GPU measurements: %zu newer frame%s", s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s");
+	if (s.frame.empty())
+	{
+		switch (profiler_frame_hint_state(s.frame.empty(), s.displayed_frame_index, s.timed_frames.size()))
+		{
+		case profiler_frame_hint::never_captured: ImGui::TextWrapped("%s", s.recording_frame ? "Capturing the current frame. Its draws appear here once the frame completes." : "No frame captured yet. Press Capture next frame, or enable Live capture, to record one."); break;
+		case profiler_frame_hint::awaiting_readback: ImGui::TextWrapped("GPU timing is on and %zu captured frame%s await their first timestamp readback. Results appear automatically once the GPU reports them.", s.timed_frames.size(), s.timed_frames.size() == 1 ? "" : "s"); break;
+		case profiler_frame_hint::captured_empty: ImGui::TextWrapped("Frame %llu was captured with no recorded actions. Capture again while the scene is running to record draws.", static_cast<unsigned long long>(s.displayed_frame_index)); break;
+		default: break; }
+	}
 	const float list_width = std::max(240.0f, ImGui::GetContentRegionAvail().x * 0.44f);
 	ImGui::BeginChild("events", ImVec2(list_width, 450), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeX);
 	if (ImGui::BeginTable("draw_list", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY))
