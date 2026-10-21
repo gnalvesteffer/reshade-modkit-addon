@@ -35,7 +35,7 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 - **[test] Add regression tests** for the new caps and validation in
   `tests/shader_edit_checks.cpp` (and `profile_checks.cpp` where relevant).
 
-### Slice C — branch `improve/profiler-frame-ux`
+### Slice C — branch `improve/profiler-frame-ux` (PR #3)
 - **[ux] Profiler/frame UX.** Improve the Profiler and Frame/pipeline tabs: clearer
   empty-state guidance, consistent column/label naming, and a visible indicator when
   the displayed frame is stale (pre-timing readback). *modkit.cpp `show_profiler`,
