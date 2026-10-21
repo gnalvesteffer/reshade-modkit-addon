@@ -2356,8 +2356,8 @@ static void import_shader_bytecode(device_state &s, const shader_info &shader)
 		if (!replacement.profile.empty() && replacement.profile.substr(0, stage.size() + 1) != stage + "_")
 		{ report(s, "The imported shader has a different stage from the selected shader."); return; }
 		const auto original = inspect_shader(shader.code.data(), shader.code.size());
-		if (!original.profile.empty() && !replacement.profile.empty() && original.profile != replacement.profile)
-			{ report(s, "The imported shader is " + replacement.profile + ", while the selected shader is " + original.profile + ". The replacement must target the same profile."); return; }
+		std::string profile_error;
+		if (!replacement_profile_ok(original, replacement, profile_error)) { report(s, profile_error); return; }
 	}
 	else if (bytes.size() < 20 || bytes.size() % 4 || bytes[0] != 3 || bytes[1] != 2 || bytes[2] != 35 || bytes[3] != 7)
 	{ report(s, "Expected SPIR-V bytecode."); return; }
@@ -2802,15 +2802,15 @@ static void draw_panel(effect_runtime *runtime)
 					{
 						std::vector<std::string> fields;
 						if (rule.shader) fields.push_back("shader " + hex_id(*rule.shader));
-						if (rule.count) fields.push_back("count " + std::to_string(*rule.count));
-						if (rule.instances) fields.push_back("instances " + std::to_string(*rule.instances));
-						if (rule.replace_count) fields.push_back("replace_count " + std::to_string(*rule.replace_count));
-						if (rule.replace_instances) fields.push_back("replace_instances " + std::to_string(*rule.replace_instances));
+						if (rule.count.has_value()) fields.push_back("count " + std::to_string(*rule.count));
+						if (rule.instances.has_value()) fields.push_back("instances " + std::to_string(*rule.instances));
+						if (rule.replace_count.has_value()) fields.push_back("replace_count " + std::to_string(*rule.replace_count));
+						if (rule.replace_instances.has_value()) fields.push_back("replace_instances " + std::to_string(*rule.replace_instances));
 						std::string details; for (auto &field : fields) { if (!details.empty()) details += ", "; details += field; }
 						ImGui::Text("%s | %s | %s%s", rule.name.c_str(), rule.kind.c_str(), rule.skip ? "skip" : "modify", details.empty() ? "" : (" | " + details).c_str());
 					}
 				}
-				else if (s.rules.empty()) ImGui::TextDisabled("No active draw rules. Add them to rules.ini with the Edit draw rules button above.");
+				else if (s.rules.empty()) ImGui::TextDisabled("No active draw rules are loaded. Add them with the Edit draw rules button above; if rules.ini already has rules, see the status line for the parse error.");
 			}
 			else
 			{
