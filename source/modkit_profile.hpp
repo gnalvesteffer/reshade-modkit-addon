@@ -28,6 +28,15 @@ inline std::string hex_id(uint64_t value)
 	result[16] = 0;
 	return result;
 }
+enum class profiler_frame_hint { none, never_captured, awaiting_readback, captured_empty };
+// Maps the displayed frame's state to the hint the profiler tabs should show.
+inline profiler_frame_hint profiler_frame_hint_state(bool frame_empty, uint64_t displayed_frame_index, size_t pending_frames)
+{
+	if (!frame_empty) return profiler_frame_hint::none;
+	if (displayed_frame_index == 0 && pending_frames > 0) return profiler_frame_hint::awaiting_readback;
+	if (displayed_frame_index > 0) return profiler_frame_hint::captured_empty;
+	return profiler_frame_hint::never_captured;
+}
 inline std::string trim(std::string value)
 {
 	const auto first = value.find_first_not_of(" \t\r\n");
