@@ -10,7 +10,7 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
 
 ## Assigned to worktrees
 
-### Slice A — branch `improve/shader-editor-qol`
+### Slice A — branch `improve/shader-editor-qol` (PR #2, CI green)
 - **[qol] Open mod directory from the UI.** The Session tab prints the mod root path
   as text, but there is no button to reveal it in Explorer. Add an "Open mod folder"
   button next to the path (reuse `open_mod_path`). *modkit.cpp `draw_panel`.*
@@ -24,7 +24,7 @@ Categories: **defect** (incorrect/fragile behavior), **feature**, **enhancement*
   and report a full-profile mismatch up front. *modkit.cpp `import_shader_bytecode`.*
 - **[docs] Document the above** in MODKIT.md (editor / rules section).
 
-### Slice B — branch `harden/parsing-tests`
+### Slice B — branch `harden/parsing-tests` (PR #1, CI green)
 - **[defect/robustness] Unbounded shader macros & include dirs.** `shader_definitions`
   and the include-dir list have no cap; a crafted `.compile.ini` or pasted editor input
   can supply an unbounded number of `-D` / `-I` arguments. Add sane caps with clear
