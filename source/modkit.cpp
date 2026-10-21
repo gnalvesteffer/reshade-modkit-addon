@@ -2355,6 +2355,9 @@ static void import_shader_bytecode(device_state &s, const shader_info &shader)
 		std::string stage = stage_name(shader.stage); for (auto &c : stage) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 		if (!replacement.profile.empty() && replacement.profile.substr(0, stage.size() + 1) != stage + "_")
 		{ report(s, "The imported shader has a different stage from the selected shader."); return; }
+		const auto original = inspect_shader(shader.code.data(), shader.code.size());
+		std::string profile_error;
+		if (!replacement_profile_ok(original, replacement, profile_error)) { report(s, profile_error); return; }
 	}
 	else if (bytes.size() < 20 || bytes.size() % 4 || bytes[0] != 3 || bytes[1] != 2 || bytes[2] != 35 || bytes[3] != 7)
 	{ report(s, "Expected SPIR-V bytecode."); return; }
@@ -2789,7 +2792,26 @@ static void draw_panel(effect_runtime *runtime)
 		{
 			s.editor_tab_requested = false;
 			if (ImGui::Button("Edit draw rules")) load_editor(s, s.root / "rules.ini", "; Draw rules\n");
-			if (s.editor_path.empty()) ImGui::TextWrapped("Select a shader and choose Open replacement editor or Import source. Texture images are edited externally from their detail panel.");
+			if (s.editor_path.empty())
+			{
+				ImGui::TextWrapped("Select a shader and choose Open replacement editor or Import source. Texture images are edited externally from their detail panel.");
+				if (!s.rules.empty() && ImGui::CollapsingHeader("Active draw rules", ImGuiTreeNodeFlags_DefaultOpen))
+				{
+					ImGui::TextDisabled("%zu rule%s from rules.ini", s.rules.size(), s.rules.size() == 1 ? "" : "s");
+					for (const auto &rule : s.rules)
+					{
+						std::vector<std::string> fields;
+						if (rule.shader) fields.push_back("shader " + hex_id(*rule.shader));
+						if (rule.count.has_value()) fields.push_back("count " + std::to_string(*rule.count));
+						if (rule.instances.has_value()) fields.push_back("instances " + std::to_string(*rule.instances));
+						if (rule.replace_count.has_value()) fields.push_back("replace_count " + std::to_string(*rule.replace_count));
+						if (rule.replace_instances.has_value()) fields.push_back("replace_instances " + std::to_string(*rule.replace_instances));
+						std::string details; for (auto &field : fields) { if (!details.empty()) details += ", "; details += field; }
+						ImGui::Text("%s | %s | %s%s", rule.name.c_str(), rule.kind.c_str(), rule.skip ? "skip" : "modify", details.empty() ? "" : (" | " + details).c_str());
+					}
+				}
+				else if (s.rules.empty()) ImGui::TextDisabled("No active draw rules are loaded. Add them with the Edit draw rules button above; if rules.ini already has rules, see the status line for the parse error.");
+			}
 			else
 			{
 				const bool hlsl = s.editor_path.extension() == ".hlsl";
@@ -2880,6 +2902,8 @@ static void draw_panel(effect_runtime *runtime)
 			ImGui::Checkbox("Capture CPU uploads (adds copy and hashing overhead)", &s.capture_uploads);
 			ImGui::TextWrapped("Off by default. Enable to capture resource contents and content IDs from new CPU uploads. Existing resources use session IDs until contents are captured.");
 			ImGui::TextWrapped("Mod directory: %s", s.root.u8string().c_str());
+			ImGui::SameLine(); if (ImGui::Button("Open mod folder")) open_mod_path(s, s.root);
+			ImGui::SetItemTooltip("Opens the per-game mod directory in a file manager. If launch is unavailable under a compatibility layer, copy the path and open it manually.");
 			ImGui::Text("%zu shaders | %zu resources | %zu pipelines", s.shaders.size(), s.resources.size(), s.pipelines.size());
 			ImGui::Text("Intercepted: %llu | Modified: %llu | Suppressed: %llu", static_cast<unsigned long long>(s.total_draws), static_cast<unsigned long long>(s.modified_draws), static_cast<unsigned long long>(s.skipped_draws));
 			ImGui::Text("CPU snapshots: %.1f / 256 MiB", s.capture_bytes / 1048576.0);

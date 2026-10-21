@@ -170,6 +170,16 @@ inline shader_interface inspect_shader(const void *code, size_t size)
 	{ info.profile.clear(); info.error = "No usable Direct3D reflection data. Import compatible source/bytecode produced by an external tool."; return info; }
 	info.dxil = true; info.error.clear(); return info;
 }
+// Accept a replacement bytecode's reflected profile for the original shader. The stage is checked separately by the caller before this.
+inline bool replacement_profile_ok(const shader_interface &original, const shader_interface &replacement, std::string &error)
+{
+	if (original.profile.empty() || replacement.profile.empty()) return true;
+	if (original.profile != replacement.profile)
+	{ error = "Import rejected: the imported shader is " + replacement.profile + ", while the selected shader is " + original.profile + ". Recompile it targeting " + original.profile + " and import again; the existing replacement is unchanged."; return false; }
+	if (original.dxil != replacement.dxil)
+	{ error = "Import rejected: the imported shader is " + std::string(replacement.dxil ? "DXIL" : "DXBC") + ", while the selected shader is " + std::string(original.dxil ? "DXIL" : "DXBC") + ". Recompile it as " + std::string(original.dxil ? "DXIL" : "DXBC") + " and import again; the existing replacement is unchanged."; return false; }
+	return true;
+}
 inline std::string parameter_semantic(const shader_parameter &param)
 { return param.semantic + (param.index ? std::to_string(param.index) : ""); }
 inline std::string pixel_shader_starter(const shader_interface &info, const std::string &entry)
